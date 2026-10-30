@@ -133,6 +133,15 @@ class Session extends EventEmitter {
     if (this.alive) this._send({ t: 'r', c: cols, r: rows });
   }
 
+  respawn() {
+    if (this.alive) return false;
+    this.exitCode = null;
+    this.alive = true;
+    this.lastActivity = Date.now();
+    this._start();
+    return true;
+  }
+
   _send(frame) {
     try {
       this.proc.stdin.write(JSON.stringify(frame) + '\n');
@@ -200,6 +209,7 @@ class SessionManager {
     this.defaultShell = options.shell || '/bin/bash';
     this.defaultCwd = options.cwd || process.cwd();
     this.idleMs = options.idleMs || 30 * 60 * 1000;
+    this.hasConnection = options.hasConnection || null;
     this._sweeper = setInterval(() => this.sweep(), 60 * 1000);
     this._sweeper.unref();
   }
@@ -208,6 +218,7 @@ class SessionManager {
     const now = Date.now();
     for (const session of this.sessions.values()) {
       if (session.alive && now - session.lastActivity > this.idleMs) {
+        if (this.hasConnection && this.hasConnection(session.id)) continue;
         session.kill();
       }
     }
@@ -248,6 +259,14 @@ class SessionManager {
     if (!name) return null;
     for (const s of this.sessions.values()) {
       if (s.name === name && s.alive) return s;
+    }
+    return null;
+  }
+
+  getDeadByName(name) {
+    if (!name) return null;
+    for (const s of this.sessions.values()) {
+      if (s.name === name && !s.alive) return s;
     }
     return null;
   }

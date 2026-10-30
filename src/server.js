@@ -32,6 +32,16 @@ const manager = new SessionManager({
   shell: settings.shell,
   cwd: settings.cwd,
   idleMs: settings.sessionIdleMs,
+  hasConnection: (id) => {
+    if (sessionViewers.get(id)?.size) return true;
+    const ops = sessionOperators.get(id);
+    if (!ops) return false;
+    const now = Date.now();
+    for (const ts of ops.values()) {
+      if (now - ts <= OPERATOR_TTL_MS) return true;
+    }
+    return false;
+  },
 });
 
 const startedAt = Date.now();
@@ -76,10 +86,16 @@ function actorOf(auth) {
 
 const sessionViewers = new Map();
 const sessionOperators = new Map();
+const sessionConn = new Map();
 const OPERATOR_TTL_MS = 60 * 1000;
+
+function touchConnection(id) {
+  sessionConn.set(id, Date.now());
+}
 
 function markOperator(id, actor) {
   if (!actor) return;
+  touchConnection(id);
   let m = sessionOperators.get(id);
   if (!m) {
     m = new Map();
@@ -111,27 +127,11 @@ function viewersOf(id) {
 function removeSession(id) {
   sessionViewers.delete(id);
   sessionOperators.delete(id);
+  sessionConn.delete(id);
   return manager.remove(id);
 }
 
-function createOrReuseSession(options, actor, ip) {
-  if (options.name) {
-    const existing = manager.getByName(options.name);
-    if (existing) {
-      trackSession(existing, actor, ip);
-      return { session: existing, reused: true };
-    }
-    manager.removeDeadByName(options.name);
-  }
-  const session = manager.create(options);
-  trackSession(session, actor, ip);
-  return { session, reused: false };
-}
-
-function trackSession(session, actor, ip) {
-  if (session._tracked) return;
-  session._tracked = true;
-  audit.add({ kind: 'session_create', actor, ip, sessionId: session.id, detail: session.id });
+function captureSessionEnd(session) {
   if (session.name === 'oneshot') return;
   session.once('exit', () => {
     audit.add({
@@ -142,6 +142,64 @@ function trackSession(session, actor, ip) {
       output: stripAnsi(session.buffer).slice(-60000),
     });
   });
+}
+
+function reopenIfDead(session, actor, ip) {
+  if (session.alive) return false;
+  session.respawn();
+  touchConnection(session.id);
+  captureSessionEnd(session);
+  audit.add({ kind: 'session_reopen', actor, ip, sessionId: session.id, detail: session.id });
+  return true;
+}
+
+function createOrReuseSession(options, actor, ip) {
+  if (options.name) {
+    const existing = manager.getByName(options.name);
+    if (existing) {
+      trackSession(existing, actor, ip);
+      return { session: existing, reused: true };
+    }
+    const dead = manager.getDeadByName(options.name);
+    if (dead) {
+      reopenIfDead(dead, actor, ip);
+      return { session: dead, reused: true };
+    }
+    manager.removeDeadByName(options.name);
+  }
+  const session = manager.create(options);
+  touchConnection(session.id);
+  trackSession(session, actor, ip);
+  return { session, reused: false };
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const s of manager.list()) {
+    const viewers = sessionViewers.get(s.id);
+    const ops = sessionOperators.get(s.id);
+    const operatorLive = ops ? [...ops.values()].some((ts) => now - ts <= OPERATOR_TTL_MS) : false;
+    if ((viewers && viewers.size) || operatorLive) {
+      sessionConn.set(s.id, now);
+      continue;
+    }
+    const last = sessionConn.get(s.id) || s.createdAt;
+    if (s.alive && now - last > settings.connIdleKillMs) {
+      const target = manager.get(s.id);
+      if (target) target.kill();
+      audit.add({ kind: 'session_idle_kill', actor: 'system', sessionId: s.id, detail: `${s.id} 无人连接超时，已自动关闭` });
+    } else if (!s.alive && now - last > settings.connIdlePurgeMs) {
+      removeSession(s.id);
+      audit.add({ kind: 'session_purge', actor: 'system', sessionId: s.id, detail: `${s.id} 长期未使用，已自动清除` });
+    }
+  }
+}, settings.connSweepMs).unref();
+
+function trackSession(session, actor, ip) {
+  if (session._tracked) return;
+  session._tracked = true;
+  audit.add({ kind: 'session_create', actor, ip, sessionId: session.id, detail: session.id });
+  captureSessionEnd(session);
 }
 
 const LOGIN_WINDOW_MS = 10 * 60 * 1000;const LOGIN_MAX_FAILS = 8;
@@ -272,6 +330,17 @@ function escapeRx(text) {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+const CSI_RX = /\x1b\[[?0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07/g;
+
+function cleanExecOutput(text) {
+  return String(text || '')
+    .replace(CSI_RX, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '')
+    .replace(/^\n+/, '')
+    .replace(/\n+$/, '');
+}
+
 const EC_SENTINEL_RX = /\n__AITB_EC=(-?\d+)__\r?\n/;
 
 function waitForSentinel(session, baseline, waitMs) {
@@ -296,8 +365,24 @@ function waitForSentinel(session, baseline, waitMs) {
   });
 }
 
-function stripEcho(region, sent) {
-  const rx = new RegExp(sent.split('').map(escapeRx).join('(?:\\r?\\n)*'), 'g');
+const EXEC_CACHE_MAX = 200;
+const execCache = new Map();
+
+function execCachePut(sessionId, requestId, payload) {
+  const key = `${sessionId}:${requestId}`;
+  execCache.set(key, { payload, ts: Date.now() });
+  if (execCache.size > EXEC_CACHE_MAX) {
+    const oldest = [...execCache.entries()].sort((a, b) => a[1].ts - b[1].ts)[0];
+    if (oldest) execCache.delete(oldest[0]);
+  }
+}
+
+function execCacheGet(sessionId, requestId) {
+  const hit = execCache.get(`${sessionId}:${requestId}`);
+  return hit ? hit.payload : null;
+}
+
+function stripEcho(region, sent) {  const rx = new RegExp(sent.split('').map(escapeRx).join('(?:\\r?\\n)*'), 'g');
   let last = null;
   let m;
   while ((m = rx.exec(region)) !== null) {
@@ -608,7 +693,7 @@ async function handleApi(req, res, url) {
       clearTimeout(hardTtl);
       const payload = {
         exitCode: session.exitCode,
-        output: String(result.data || '').replace(/\r\n/g, '\n'),
+        output: cleanExecOutput(result.data),
         truncated: session.alive,
       };
       if (body.keep) {
@@ -674,6 +759,12 @@ async function handleApi(req, res, url) {
       if (!body.command || typeof body.command !== 'string') {
         return sendJson(res, 400, { error: 'command is required' }, corsHeaders(req));
       }
+      if (body.requestId) {
+        const cached = execCacheGet(session.id, body.requestId);
+        if (cached) {
+          return sendJson(res, 200, { ...cached, cached: true }, corsHeaders(req));
+        }
+      }
       const baseline = session.buffer.length;
       const sent = body.command.replace(/\r?\n$/, '') + '; printf \'\\n__AITB_EC=%s__\\n\' "$?"';
       session.write(sent + '\r');
@@ -682,15 +773,16 @@ async function handleApi(req, res, url) {
       const result = await waitForSentinel(session, baseline, waitMs);
       let output = stripEcho(result.before, sent);
       if (result.found) output = output.replace(/^\r?\n/, '').replace(/\r?\n$/, '');
-      const normalized = output.replace(/\r\n/g, '\n');
-      return sendJson(res, 200, {
+      const payload = {
         sessionId: session.id,
         offset: session.buffer.length,
-        output: normalized,
+        output: cleanExecOutput(output),
         alive: session.alive,
         exitCode: result.found ? result.exitCode : null,
         truncated: !result.found,
-      }, corsHeaders(req));
+      };
+      if (body.requestId) execCachePut(session.id, body.requestId, payload);
+      return sendJson(res, 200, payload, corsHeaders(req));
     }
 
     if (action === '/kill' && method === 'POST') {
@@ -793,7 +885,9 @@ wss.on('connection', (ws, req, url, auth) => {
   };
 
   const onData = (data) => {
-    if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'output', data }));
+    if (ws.readyState !== ws.OPEN) return;
+    if (ws.bufferedAmount > 4 * 1024 * 1024) return;
+    ws.send(JSON.stringify({ type: 'output', data }));
   };
   const onExit = (code) => {
     if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'exit', code }));
@@ -816,6 +910,7 @@ wss.on('connection', (ws, req, url, auth) => {
       ws.close();
       return;
     }
+    reopenIfDead(existing, actorOf(auth), req.socket.remoteAddress || 'unknown');
     attach(existing);
   } else {
     const wsName = (url.searchParams.get('name') || '').trim();
@@ -833,6 +928,7 @@ wss.on('connection', (ws, req, url, auth) => {
   }
   const wsIp = req.socket.remoteAddress || 'unknown';
   const wsActor = actorOf(auth);
+  touchConnection(session.id);
   audit.add({ kind: 'ws_connect', actor: wsActor, ip: wsIp, sessionId: session.id, detail: session.id });
   if (!session.name || session.name !== 'oneshot') trackSession(session, wsActor, wsIp);
   let viewerSet = sessionViewers.get(session.id);
@@ -865,6 +961,7 @@ wss.on('connection', (ws, req, url, auth) => {
   });
 
   ws.on('close', () => {
+    if (session) touchConnection(session.id);
     audit.add({ kind: 'ws_disconnect', actor: wsActor, ip: wsIp, sessionId: session ? session.id : '', detail: session ? session.id : '' });
     if (session && sessionViewers.has(session.id)) {
       const set = sessionViewers.get(session.id);
@@ -878,7 +975,17 @@ wss.on('connection', (ws, req, url, auth) => {
   });
 });
 
-function shutdown() {
+function logCrash(kind, err) {
+  try {
+    const line = `${new Date().toISOString()} [${kind}] ${(err && err.stack) || err}\n`;
+    fs.mkdirSync(settings.stateDir, { recursive: true, mode: 0o700 });
+    fs.appendFileSync(path.join(settings.stateDir, 'crash.log'), line);
+  } catch {
+    /* ignore */
+  }
+}
+
+function shutdown(reason) {
   try {
     tokens.flush();
   } catch {
@@ -895,8 +1002,23 @@ function shutdown() {
   setTimeout(() => process.exit(0), 1500).unref();
 }
 
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
+process.on('SIGINT', () => {
+  logCrash('signal', 'SIGINT received');
+  shutdown();
+});
+process.on('SIGTERM', () => {
+  logCrash('signal', 'SIGTERM received');
+  shutdown();
+});
+process.on('uncaughtException', (err) => {
+  logCrash('uncaughtException', err);
+  console.error('[aitb] uncaughtException, shutting down:', err.stack || err);
+  shutdown();
+});
+process.on('unhandledRejection', (err) => {
+  logCrash('unhandledRejection', err);
+  console.error('[aitb] unhandledRejection:', (err && err.stack) || err);
+});
 
 if (require.main === module) {
   server.listen(settings.port, settings.host, () => {

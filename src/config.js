@@ -51,6 +51,13 @@ function load(envFile = path.join(__dirname, '..', '.env')) {
   const tokensFile = process.env.AITB_TOKENS_FILE || path.join(STATE_DIR, 'tokens.json');
   const accountsFile = process.env.AITB_ACCOUNTS_FILE || path.join(STATE_DIR, 'accounts.json');
   const auditMaxAgeDays = int(process.env.AITB_AUDIT_MAX_AGE_DAYS, 30);
+  const num = (value, fallback) => {
+    const n = Number(value);
+    return Number.isFinite(n) && n > 0 ? n : fallback;
+  };
+  const connIdleKillMs = num(process.env.AITB_CONN_IDLE_KILL_MS, 60 * 60 * 1000);
+  const connIdlePurgeMs = num(process.env.AITB_CONN_PURGE_MS, 3 * 24 * 60 * 60 * 1000);
+  const connSweepMs = num(process.env.AITB_CONN_SWEEP_MS, 60 * 1000);
   return {
     host: process.env.AITB_HOST || '127.0.0.1',
     port: int(process.env.AITB_PORT, 8787),
@@ -60,6 +67,9 @@ function load(envFile = path.join(__dirname, '..', '.env')) {
     auditFile: process.env.AITB_AUDIT_FILE || path.join(STATE_DIR, 'audit.json'),
     auditMaxAgeMs: auditMaxAgeDays * 24 * 60 * 60 * 1000,
     auditMaxAgeDays,
+    connIdleKillMs,
+    connIdlePurgeMs,
+    connSweepMs,
     loginUser: process.env.AITB_LOGIN_USER || 'admin',
     shell: process.env.AITB_SHELL || '/bin/bash',
     cwd: process.env.AITB_CWD || process.cwd(),

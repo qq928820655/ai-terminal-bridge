@@ -449,6 +449,22 @@ test('session exec returns real exit code and clean output', async () => {
   assert.equal(slow.data.output.includes('INNER_A'), true);
   assert.equal(slow.data.output.includes('INNER_B'), true);
 
+  assert.equal(slow.data.output.includes('\x1b'), false, 'ansi leaked');
+  assert.equal(slow.data.output.includes('\r'), false, 'CR leaked');
+
+  const dup = await api('POST', `/api/sessions/${sid}/exec`, {
+    command: 'echo IDEMPOTENT_CHECK',
+    requestId: 'req-test-001',
+  });
+  assert.equal(dup.status, 200);
+  const replay = await api('POST', `/api/sessions/${sid}/exec`, {
+    command: 'echo IDEMPOTENT_CHECK',
+    requestId: 'req-test-001',
+  });
+  assert.equal(replay.status, 200);
+  assert.equal(replay.data.cached, true);
+  assert.deepEqual(replay.data.output, dup.data.output);
+
   await api('DELETE', `/api/sessions/${sid}`);
 });
 
@@ -464,6 +480,40 @@ test('exec sessions are ephemeral and purgeable', async () => {
 
   const list = await api('GET', '/api/sessions');
   assert.equal(list.data.sessions.some((s) => s.ephemeral), false);
+});
+
+test('closed sessions reopen with history and cwd', async () => {
+  const created = await api('POST', '/api/sessions', { name: 'reopen-me', cwd: '/tmp' });
+  assert.equal(created.status, 201);
+  const sid = created.data.session.id;
+
+  await api('POST', `/api/sessions/${sid}/input`, { data: 'echo MARKER_BEFORE_CLOSE\r' });
+  await new Promise((r) => setTimeout(r, 300));
+
+  await api('POST', `/api/sessions/${sid}/kill`);
+  let dead = false;
+  for (let i = 0; i < 20 && !dead; i++) {
+    await new Promise((r) => setTimeout(r, 150));
+    const info = await api('GET', `/api/sessions/${sid}`);
+    dead = info.data.session.alive === false;
+  }
+  assert.equal(dead, true);
+
+  const again = await api('POST', '/api/sessions', { name: 'reopen-me' });
+  assert.equal(again.status, 200);
+  assert.equal(again.data.reused, true);
+  assert.equal(again.data.session.id, sid);
+  assert.equal(again.data.session.alive, true);
+
+  const snap = await api('GET', `/api/sessions/${sid}?strip=1`);
+  assert.equal(snap.status, 200);
+  assert.equal(snap.data.session.data.includes('MARKER_BEFORE_CLOSE'), true);
+  assert.equal(snap.data.session.cwd, '/tmp');
+
+  const list = await api('GET', '/api/sessions');
+  assert.equal(list.data.sessions.some((s) => s.id === sid), true);
+
+  await api('DELETE', `/api/sessions/${sid}`);
 });
 
 test('ws upgrade with invalid token returns 401 json', async () => {

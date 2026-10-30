@@ -395,7 +395,9 @@ function renderSessions(sessions) {
     const parts = [];
     if (live.length) {
       parts.push(`使用中：${live.join('、')}`);
-    } else if (s.alive) {
+    } else if (!s.alive) {
+      parts.push('已退出 · 点击重新开启');
+    } else {
       parts.push('空闲');
     }
     if (s.lastOperator && !live.includes(s.lastOperator)) {
@@ -521,6 +523,8 @@ async function loadAudit() {
       ws_connect: '终端接入', ws_disconnect: '终端断开', ws_kill: '终止终端',
       api: '接口调用', forbidden: '权限拒绝',
       session_create: '创建终端', session_end: '终端结束',
+      session_idle_kill: '空闲关闭', session_purge: '自动清除',
+      session_reopen: '重新开启',
     };
     for (const ev of auditCache.slice(-80).reverse()) {
       const li = document.createElement('li');

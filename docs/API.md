@@ -153,14 +153,30 @@ curl -s "$BASE/api/tokens/tok_xxxx/reveal" -H "Authorization: Bearer qq928820655
 
 ### POST /api/sessions
 
-创建交互式 shell 会话。body 可选：`cwd`、`shell`、`cols`、`rows`、`name`。
+创建交互式 shell 会话。body 可选：`name`、`cwd`、`shell`、`cols`、`rows`。
+
+**按名创建（幂等，推荐给 AI 持续使用）**：`name` 已存在且活跃时直接返回该会话（`reused:true`，HTTP 200），不存在才新建（`reused:false`，HTTP 201）。同名死会话自动清理。
 
 ```bash
+# 重复调用安全，永远拿到同一个 "ai-work" 会话
 curl -s -X POST "$BASE/api/sessions" \
   -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" \
-  -d '{"cwd":"/workspace"}'
-# {"session":{"id":"s1a2b3c4d5e6",...}}
+  -d '{"name":"ai-work","cwd":"/workspace"}'
+# 第一次: {"session":{"id":"s1a2b3c4d5e6",...},"reused":false}   (201)
+# 之后:   {"session":{"id":"s1a2b3c4d5e6",...},"reused":true}    (200)
 ```
+
+WebSocket 同样支持按名接入：`/ws?token=<token>&name=ai-work`，会话存在则附加，不存在自动创建。
+
+### 会话自动生命周期
+
+| 条件 | 行为 |
+|---|---|
+| 超过 **60 分钟** 无人连接（无 WS 观察者且无 HTTP 操作者） | 自动关闭进程（会话保留在列表，可查看历史输出） |
+| 关闭后超过 **3 天** 无人使用 | 自动从列表清除（审计存档不受影响） |
+| 有人连接/操作期间 | 不会触发上述清理 |
+
+可用 `AITB_CONN_IDLE_KILL_MINUTES`、`AITB_CONN_PURGE_DAYS` 调整；清理动作记录在访问记录（`空闲关闭` / `自动清除`）。
 
 ### GET /api/sessions/:id
 
