@@ -116,7 +116,8 @@ def main():
                         set_winsize(fd, int(frame.get("r") or rows), int(frame.get("c") or cols))
                     elif kind == "k":
                         try:
-                            os.kill(pid, signal.SIGHUP)
+                            # SIGTERM 让脚本有机会跑 trap 清理；强杀由上层对 worker 发 SIGKILL 兜底
+                            os.kill(pid, signal.SIGTERM)
                         except OSError:
                             pass
 

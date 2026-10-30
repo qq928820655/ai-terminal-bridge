@@ -58,6 +58,9 @@ function load(envFile = path.join(__dirname, '..', '.env')) {
   const connIdleKillMs = num(process.env.AITB_CONN_IDLE_KILL_MS, 60 * 60 * 1000);
   const connIdlePurgeMs = num(process.env.AITB_CONN_PURGE_MS, 3 * 24 * 60 * 60 * 1000);
   const connSweepMs = num(process.env.AITB_CONN_SWEEP_MS, 60 * 1000);
+  const uploadMaxBytes = int(process.env.AITB_UPLOAD_MAX_BYTES, 10 * 1024 * 1024);
+  const execMaxMs = int(process.env.AITB_EXEC_MAX_MS, 10 * 60 * 1000);
+  const execJobTtlMs = int(process.env.AITB_EXEC_TTL_MS, 10 * 60 * 1000);
   return {
     host: process.env.AITB_HOST || '127.0.0.1',
     port: int(process.env.AITB_PORT, 8787),
@@ -70,6 +73,9 @@ function load(envFile = path.join(__dirname, '..', '.env')) {
     connIdleKillMs,
     connIdlePurgeMs,
     connSweepMs,
+    uploadMaxBytes,
+    execMaxMs,
+    execJobTtlMs,
     loginUser: process.env.AITB_LOGIN_USER || 'admin',
     shell: process.env.AITB_SHELL || '/bin/bash',
     cwd: process.env.AITB_CWD || process.cwd(),

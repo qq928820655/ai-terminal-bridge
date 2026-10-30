@@ -586,3 +586,204 @@ test('named sessions are reused and http operators are visible', async () => {
 
   await api('DELETE', `/api/sessions/${sid}`);
 });
+
+// ---- v13: exec/timeout/detach/file 修复验证 ----
+
+test('exec with sleeps runs to completion (no quiet-gap early cut)', async () => {
+  const t0 = Date.now();
+  const { status, data } = await api('POST', '/api/exec', {
+    command: 'for i in 1 2 3; do echo TICK_$i; sleep 1; done',
+    timeoutMs: 15000,
+  });
+  assert.equal(status, 200);
+  assert.equal(data.exitCode, 0);
+  assert.equal(data.timedOut, false);
+  assert.equal(data.truncated, false);
+  for (const i of [1, 2, 3]) {
+    assert.equal(data.output.includes(`TICK_${i}`), true, `missing TICK_${i}`);
+  }
+  assert.equal(Date.now() - t0 >= 2800, true, 'returned before command finished');
+});
+
+test('exec timeout reports 124/timedOut/killed instead of null', async () => {
+  const t0 = Date.now();
+  const { status, data } = await api('POST', '/api/exec', {
+    command: 'echo BEFORE_SLEEP; sleep 6; echo AFTER_SLEEP',
+    timeoutMs: 1200,
+  });
+  assert.equal(status, 200);
+  assert.equal(data.exitCode, 124);
+  assert.equal(data.timedOut, true);
+  assert.equal(data.killed, true);
+  assert.equal(data.truncated, true);
+  assert.equal(data.truncatedReason, 'timeout');
+  assert.equal(data.output.includes('BEFORE_SLEEP'), true);
+  assert.equal(data.output.includes('AFTER_SLEEP'), false);
+  assert.equal(Date.now() - t0 < 5000, true, 'timeout did not fire promptly');
+});
+
+test('exec echoes requestId and replays cached result without re-running', async () => {
+  const rnd = Math.random().toString(36).slice(2, 8);
+  const f = `/tmp/aitb-dq-${rnd}`;
+  const cmd = `echo x >> ${f}; wc -l < ${f}`;
+  const reqId = `dq-${rnd}`;
+
+  const first = await api('POST', '/api/exec', { command: cmd, requestId: reqId });
+  assert.equal(first.status, 200);
+  assert.equal(first.data.requestId, reqId);
+  assert.equal(first.data.cached, undefined);
+  assert.equal(first.data.exitCode, 0);
+  assert.equal(first.data.output.trim(), '1');
+
+  const replay = await api('POST', '/api/exec', { command: cmd, requestId: reqId });
+  assert.equal(replay.status, 200);
+  assert.equal(replay.data.cached, true);
+  assert.equal(replay.data.requestId, reqId);
+  assert.equal(replay.data.output.trim(), '1', 'replay must not re-execute');
+
+  const counter = await api('POST', '/api/exec', { command: `wc -l < ${f}; rm -f ${f}` });
+  assert.equal(counter.data.output.trim(), '1', 'command executed more than once');
+});
+
+test('concurrent duplicate requestId runs command once', async () => {
+  const rnd = Math.random().toString(36).slice(2, 8);
+  const f = `/tmp/aitb-cd-${rnd}`;
+  const reqId = `cd-${rnd}`;
+  const cmd = `sleep 0.6; echo n >> ${f}; wc -l < ${f}`;
+  const [a, b] = await Promise.all([
+    api('POST', '/api/exec', { command: cmd, requestId: reqId }),
+    api('POST', '/api/exec', { command: cmd, requestId: reqId }),
+  ]);
+  assert.equal(a.status, 200);
+  assert.equal(b.status, 200);
+  const total = await api('POST', '/api/exec', { command: `wc -l < ${f}; rm -f ${f}` });
+  assert.equal(total.data.output.trim(), '1', 'duplicate requestId executed twice');
+});
+
+test('detach exec: immediate id, status and output polling', async () => {
+  const started = await api('POST', '/api/exec', {
+    command: 'echo DETACH_OK; sleep 1; echo DETACH_DONE',
+    detach: true,
+    timeoutMs: 15000,
+  });
+  assert.equal(started.status, 200);
+  assert.equal(started.data.detached, true);
+  assert.equal(started.data.status, 'running');
+  const execId = started.data.execId;
+  assert.equal(Boolean(execId), true);
+
+  let status;
+  for (let i = 0; i < 40; i++) {
+    await new Promise((r) => setTimeout(r, 200));
+    status = await api('GET', `/api/exec/${execId}/status`);
+    assert.equal(status.status, 200);
+    if (status.data.status !== 'running') break;
+  }
+  assert.equal(status.data.status, 'exited');
+  assert.equal(status.data.exitCode, 0);
+
+  const out = await api('GET', `/api/exec/${execId}/output?offset=0`);
+  assert.equal(out.status, 200);
+  assert.equal(out.data.exitCode, 0);
+  assert.equal(out.data.timedOut, false);
+  assert.equal(out.data.data.includes('DETACH_OK'), true);
+  assert.equal(out.data.data.includes('DETACH_DONE'), true);
+  assert.equal(out.data.bytesReturned > 0, true);
+  assert.equal(out.data.offset >= out.data.bytesTotal, true);
+});
+
+test('detach exec: detached job keeps running after client would time out', async () => {
+  const started = await api('POST', '/api/exec', {
+    command: 'sleep 2; echo LATE_DONE',
+    detach: true,
+    timeoutMs: 15000,
+  });
+  assert.equal(started.status, 200);
+  const execId = started.data.execId;
+  await new Promise((r) => setTimeout(r, 300));
+  const mid = await api('GET', `/api/exec/${execId}/status`);
+  assert.equal(mid.data.status, 'running');
+  assert.equal(mid.data.exitCode, null);
+});
+
+test('detach exec: timeout marks job timeout with exit 124', async () => {
+  const started = await api('POST', '/api/exec', {
+    command: 'sleep 8',
+    detach: true,
+    timeoutMs: 1000,
+  });
+  const execId = started.data.execId;
+  let status;
+  for (let i = 0; i < 30; i++) {
+    await new Promise((r) => setTimeout(r, 200));
+    status = await api('GET', `/api/exec/${execId}/status`);
+    if (status.data.status !== 'running') break;
+  }
+  assert.equal(status.data.status, 'timeout');
+  assert.equal(status.data.timedOut, true);
+  assert.equal(status.data.exitCode, 124);
+
+  const del = await api('DELETE', `/api/exec/${execId}`);
+  assert.equal(del.status, 200);
+});
+
+test('file upload and download roundtrip with sha256', async () => {
+  const rnd = Math.random().toString(36).slice(2, 8);
+  const fp = `/tmp/aitb-up-${rnd}.bin`;
+  const bytes = Buffer.alloc(64 * 1024);
+  for (let i = 0; i < bytes.length; i++) bytes[i] = (i * 7 + (i >> 8)) & 0xff;
+
+  const put = await fetch(`${BASE}/api/files?path=${encodeURIComponent(fp)}`, {
+    method: 'PUT',
+    headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/octet-stream' },
+    body: bytes,
+  });
+  assert.equal(put.status, 200);
+  const putData = await put.json();
+  assert.equal(putData.bytes, bytes.length);
+  const { createHash } = require('node:crypto');
+  const expectHash = createHash('sha256').update(bytes).digest('hex');
+  assert.equal(putData.sha256, expectHash);
+
+  const remote = await api('POST', '/api/exec', { command: `sha256sum ${fp}` });
+  assert.equal(remote.data.output.includes(expectHash), true);
+
+  const get = await fetch(`${BASE}/api/files?path=${encodeURIComponent(fp)}`, {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  });
+  assert.equal(get.status, 200);
+  assert.equal(get.headers.get('x-aitb-sha256'), expectHash);
+  const got = Buffer.from(await get.arrayBuffer());
+  assert.equal(got.length, bytes.length);
+  assert.equal(got.equals(bytes), true);
+
+  await api('POST', '/api/exec', { command: `rm -f ${fp}` });
+});
+
+test('file endpoints return structured errors', async () => {
+  const noPath = await fetch(`${BASE}/api/files`, {
+    method: 'PUT',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: 'x',
+  });
+  assert.equal(noPath.status, 400);
+  assert.equal((await noPath.json()).code, 'bad_request');
+
+  const missing = await api('GET', `/api/files?path=${encodeURIComponent('/tmp/aitb-nope-xyz')}`);
+  assert.equal(missing.status, 404);
+  assert.equal(missing.data.code, 'file_not_found');
+
+  const job = await api('GET', '/api/exec/snonexistent/status');
+  assert.equal(job.status, 404);
+  assert.equal(job.data.code, 'exec_not_found');
+});
+
+test('exec reports 127 for missing command and auth errors carry codes', async () => {
+  const nf = await api('POST', '/api/exec', { command: 'aitb-nonexistent-cmd-xyz' });
+  assert.equal(nf.status, 200);
+  assert.equal(nf.data.exitCode, 127);
+
+  const unauth = await fetch(BASE + '/api/exec', { method: 'POST' });
+  assert.equal(unauth.status, 401);
+  assert.equal((await unauth.json()).code, 'auth_failed');
+});

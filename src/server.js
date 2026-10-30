@@ -3,6 +3,7 @@
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { URL } = require('node:url');
 const { WebSocketServer } = require('ws');
 const { SessionManager, stripAnsi } = require('./sessions');
@@ -242,13 +243,17 @@ function sendJson(res, status, payload, extraHeaders = {}) {
   res.end(body);
 }
 
+function sendError(res, req, status, code, message, extra = {}) {
+  return sendJson(res, status, { error: message, code, ...extra }, corsHeaders(req));
+}
+
 function corsHeaders(req) {
   if (!settings.cors) return {};
   const origin = req.headers.origin || settings.cors;
   return {
     'access-control-allow-origin': settings.cors === '*' ? '*' : origin,
     'access-control-allow-headers': 'authorization,content-type,x-aitb-token',
-    'access-control-allow-methods': 'GET,POST,DELETE,OPTIONS',
+    'access-control-allow-methods': 'GET,POST,PUT,DELETE,OPTIONS',
     'access-control-max-age': '600',
   };
 }
@@ -260,7 +265,7 @@ async function readBody(req, limit = 1024 * 1024) {
     req.on('data', (chunk) => {
       size += chunk.length;
       if (size > limit) {
-        reject(Object.assign(new Error('payload too large'), { status: 413 }));
+        reject(Object.assign(new Error('payload too large'), { status: 413, code: 'payload_too_large' }));
         req.destroy();
         return;
       }
@@ -272,17 +277,39 @@ async function readBody(req, limit = 1024 * 1024) {
       try {
         resolve(JSON.parse(raw));
       } catch {
-        reject(Object.assign(new Error('invalid json body'), { status: 400 }));
+        reject(Object.assign(new Error('invalid json body'), { status: 400, code: 'bad_json' }));
       }
     });
     req.on('error', reject);
   });
 }
 
+function readRaw(req, limit) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > limit) {
+        reject(Object.assign(new Error('payload too large'), { status: 413, code: 'payload_too_large' }));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+function sha256(buf) {
+  return crypto.createHash('sha256').update(buf).digest('hex');
+}
+
 function requireSession(id) {
   const session = manager.get(id);
   if (!session) {
-    throw Object.assign(new Error(`session not found: ${id}`), { status: 404 });
+    throw Object.assign(new Error(`session not found: ${id}`), { status: 404, code: 'session_not_found' });
   }
   return session;
 }
@@ -294,33 +321,37 @@ function waitForOutput(session, { since, waitMs = 800, quietMs = 250, mustExit =
     let lastChange = Date.now();
     let finished = false;
 
-    const finish = () => {
+    const finish = (timedOut) => {
       if (finished) return;
       finished = true;
       session.removeListener('data', onData);
       session.removeListener('exit', onExit);
       clearInterval(timer);
-      resolve(session.snapshot(since, { strip: true }));
+      resolve({ ...session.snapshot(since, { strip: true }), timedOut: Boolean(timedOut) });
     };
 
     const onData = () => {
       lastLen = session.buffer.length;
       lastChange = Date.now();
     };
-    const onExit = () => finish();
+    const onExit = () => finish(false);
 
     session.on('data', onData);
     session.on('exit', onExit);
 
     const timer = setInterval(() => {
-      const idleFor = Date.now() - lastChange;
-      if (mustExit && !session.alive) return finish();
+      // mustExit 模式只认进程退出或总超时，静默间隙（如脚本里的 sleep）不算完成
+      if (mustExit) {
+        if (!session.alive) return finish(false);
+        if (Date.now() >= deadline) return finish(true);
+        return;
+      }
       if (lastLen !== session.buffer.length) {
         lastLen = session.buffer.length;
         lastChange = Date.now();
       }
-      if (idleFor >= quietMs) return finish();
-      if (Date.now() >= deadline) return finish();
+      if (idleFor >= quietMs) return finish(false);
+      if (Date.now() >= deadline) return finish(true);
     }, 30);
     timer.unref();
   });
@@ -367,9 +398,9 @@ function waitForSentinel(session, baseline, waitMs) {
 
 const EXEC_CACHE_MAX = 200;
 const execCache = new Map();
+const execInflight = new Map();
 
-function execCachePut(sessionId, requestId, payload) {
-  const key = `${sessionId}:${requestId}`;
+function execCachePut(key, payload) {
   execCache.set(key, { payload, ts: Date.now() });
   if (execCache.size > EXEC_CACHE_MAX) {
     const oldest = [...execCache.entries()].sort((a, b) => a[1].ts - b[1].ts)[0];
@@ -377,10 +408,119 @@ function execCachePut(sessionId, requestId, payload) {
   }
 }
 
-function execCacheGet(sessionId, requestId) {
-  const hit = execCache.get(`${sessionId}:${requestId}`);
+function execCacheGet(key) {
+  const hit = execCache.get(key);
   return hit ? hit.payload : null;
 }
+
+// 同一 requestId 的并发重复请求共用同一个在途 Promise：代理层重试不会重复执行命令
+function execDedupe(key, run) {
+  const hit = execCacheGet(key);
+  if (hit) return Promise.resolve({ payload: hit, cached: true });
+  const pending = execInflight.get(key);
+  if (pending) return pending.then((payload) => ({ payload, cached: false }));
+  const p = (async () => {
+    try {
+      const payload = await run();
+      execCachePut(key, payload);
+      return payload;
+    } finally {
+      execInflight.delete(key);
+    }
+  })();
+  execInflight.set(key, p);
+  return p.then((payload) => ({ payload, cached: false }));
+}
+
+// ---- detach 执行任务 ----
+const execJobs = new Map(); // execId -> job
+const execJobByRequest = new Map(); // requestId -> execId
+
+function execJobStatus(job) {
+  if (!job.finished) return 'running';
+  return job.payload.status || 'exited';
+}
+
+function buildExecPayload(job, result) {
+  const session = job.session;
+  const timedOut = Boolean(result.timedOut);
+  const raw = String(result.data || '');
+  const output = cleanExecOutput(raw);
+  const durationMs = Date.now() - job.startedAt;
+  return {
+    execId: job.id,
+    requestId: job.requestId || undefined,
+    commandLabel: job.label,
+    status: timedOut ? 'timeout' : 'exited',
+    exitCode: timedOut ? 124 : session.exitCode,
+    output,
+    truncated: timedOut,
+    truncatedReason: timedOut ? 'timeout' : undefined,
+    timedOut,
+    killed: timedOut,
+    bytesReturned: Buffer.byteLength(output),
+    bytesTotal: Buffer.byteLength(raw),
+    durationMs,
+  };
+}
+
+function escalateKill(session) {
+  // 先 SIGTERM 里面的命令，随后强杀 worker（pty 关闭连带子进程退出）
+  session.kill('SIGTERM');
+}
+
+async function runDetachedJob(job) {
+  const { session } = job;
+  let spawnError = '';
+  const onError = (msg) => {
+    if (!spawnError) spawnError = String(msg);
+  };
+  session.on('error', onError);
+  const result = await waitForOutput(session, {
+    since: 0,
+    waitMs: job.timeoutMs,
+    quietMs: 0,
+    mustExit: true,
+  });
+  session.removeListener('error', onError);
+  if (result.timedOut) escalateKill(session);
+  await new Promise((r) => setTimeout(r, result.timedOut ? 400 : 0));
+  if (spawnError && !session.exitCode && !String(result.data || '').length) {
+    job.finished = true;
+    job.payload = {
+      execId: job.id,
+      requestId: job.requestId || undefined,
+      commandLabel: job.label,
+      status: 'failed',
+      exitCode: null,
+      output: '',
+      truncated: false,
+      timedOut: false,
+      error: 'spawn_failed',
+      detail: spawnError.slice(0, 500),
+      bytesReturned: 0,
+      bytesTotal: 0,
+      durationMs: Date.now() - job.startedAt,
+    };
+  } else {
+    job.payload = buildExecPayload(job, result);
+    job.finished = true;
+  }
+  job.finishedAt = Date.now();
+  // 从 manager 摘除（已退出，不影响 UI 会话列表与生命周期清扫），缓冲区仍留在 job 里供拉取
+  manager.remove(job.id);
+  if (job.requestId) execCachePut(`execid:${job.requestId}`, { execId: job.id });
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, job] of execJobs) {
+    if (job.finished && now - (job.finishedAt || now) > settings.execJobTtlMs) {
+      execJobs.delete(id);
+      if (job.requestId) execJobByRequest.delete(job.requestId);
+    }
+  }
+}, 30 * 1000).unref();
 
 function stripEcho(region, sent) {  const rx = new RegExp(sent.split('').map(escapeRx).join('(?:\\r?\\n)*'), 'g');
   let last = null;
@@ -433,7 +573,7 @@ async function handleApi(req, res, url) {
   if (pathname === '/api/auth/login' && method === 'POST') {
     const ip = req.socket.remoteAddress || 'unknown';
     if (!loginAllowed(ip)) {
-      return sendJson(res, 429, { error: 'too many failed attempts, retry in a minute' }, corsHeaders(req));
+      return sendJson(res, 429, { error: 'too many failed attempts, retry in a minute', code: 'rate_limited' }, corsHeaders(req));
     }
     const body = await readBody(req);
     const username = String(body.username || settings.loginUser).trim() || settings.loginUser;
@@ -468,18 +608,18 @@ async function handleApi(req, res, url) {
     }
     recordLoginFail(ip);
     audit.add({ kind: 'login_fail', actor: username || '-', ip });
-    return sendJson(res, 401, { error: 'wrong username or password' }, corsHeaders(req));
+    return sendJson(res, 401, { error: 'wrong username or password', code: 'auth_failed' }, corsHeaders(req));
   }
 
   const auth = authenticate(req, url);
   if (!auth) {
-    return sendJson(res, 401, { error: 'unauthorized', hint: 'send Authorization: Bearer <token>' }, corsHeaders(req));
+    return sendJson(res, 401, { error: 'unauthorized', code: 'auth_failed', hint: 'send Authorization: Bearer <token>' }, corsHeaders(req));
   }
 
   const need = (scope) => {
     if (hasScope(auth, scope)) return true;
     audit.add({ kind: 'forbidden', actor: actorOf(auth), ip: req.socket.remoteAddress, detail: `${method} ${pathname}` });
-    sendJson(res, 403, { error: 'forbidden', requiredScope: scope, scopes: auth.scopes }, corsHeaders(req));
+    sendJson(res, 403, { error: 'forbidden', code: 'forbidden', requiredScope: scope, scopes: auth.scopes }, corsHeaders(req));
     return false;
   };
 
@@ -656,57 +796,240 @@ async function handleApi(req, res, url) {
     if (!need('exec')) return;
     const body = await readBody(req);
     if (!body.command || typeof body.command !== 'string') {
-      return sendJson(res, 400, { error: 'command is required' }, corsHeaders(req));
+      return sendError(res, req, 400, 'bad_request', 'command is required');
     }
+    const requestId = body.requestId ? String(body.requestId).slice(0, 128) : '';
     const shell = body.shell || settings.shell;
     const cmdLabel = body.command.replace(/\s+/g, ' ').trim().slice(0, 20) || 'cmd';
-    const session = manager.create({
-      cwd: body.cwd || settings.cwd,
-      shell,
-      cols: body.cols || 500,
-      rows: body.rows || 50,
-      name: `exec:${cmdLabel}`,
-      argv: [shell, '-c', body.command],
-      ephemeral: !body.keep,
-    });
-    let settled = false;
-    const reap = () => {
-      if (settled) return;
-      settled = true;
-      removeSession(session.id);
-    };
-    req.on('close', () => {
-      if (!res.writableEnded) reap();
-    });
-    const hardTtl = setTimeout(reap, Math.min(Number(body.timeoutMs) || 15000, 120000) + 30000);
-    hardTtl.unref();
-    try {
-      const timeoutMs = Math.min(Number(body.timeoutMs) || 15000, 120000);
-      const quietMs = Math.min(Number(body.quietMs) || 1000, 30000);
-      const result = await waitForOutput(session, {
-        since: 0,
-        waitMs: timeoutMs,
-        quietMs: session.alive ? quietMs : 1,
-        mustExit: true,
+
+    const createExecSession = () =>
+      manager.create({
+        cwd: body.cwd || settings.cwd,
+        shell,
+        cols: body.cols || 500,
+        rows: body.rows || 50,
+        name: `exec:${cmdLabel}`,
+        argv: [shell, '-c', body.command],
+        ephemeral: !body.keep,
       });
-      settled = true;
-      clearTimeout(hardTtl);
-      const payload = {
-        exitCode: session.exitCode,
-        output: cleanExecOutput(result.data),
-        truncated: session.alive,
-      };
-      if (body.keep) {
-        return sendJson(res, 200, { sessionId: session.id, ...payload, kept: true }, corsHeaders(req));
+
+    // ---- detach 模式：立即返回 execId，用 status/output 接口拉取 ----
+    if (body.detach) {
+      if (requestId) {
+        const existingId = execJobByRequest.get(requestId);
+        if (existingId) {
+          const existing = execJobs.get(existingId);
+          if (existing) {
+            return sendJson(res, 200, {
+              execId: existingId,
+              detached: true,
+              status: execJobStatus(existing),
+              cached: true,
+              requestId,
+            }, corsHeaders(req));
+          }
+        }
       }
-      setTimeout(() => removeSession(session.id), 50).unref();
-      return sendJson(res, 200, payload, corsHeaders(req));
-    } catch (err) {
-      settled = true;
-      clearTimeout(hardTtl);
-      removeSession(session.id);
-      throw err;
+      const maxMs = Math.min(Number(body.timeoutMs) || 15000, settings.execMaxMs);
+      const session = createExecSession();
+      const job = {
+        id: session.id,
+        session,
+        label: cmdLabel,
+        requestId,
+        startedAt: Date.now(),
+        timeoutMs: maxMs,
+        finished: false,
+        payload: null,
+      };
+      execJobs.set(job.id, job);
+      if (requestId) execJobByRequest.set(requestId, job.id);
+      runDetachedJob(job).catch(() => {});
+      return sendJson(res, 200, {
+        execId: job.id,
+        detached: true,
+        status: 'running',
+        requestId: requestId || undefined,
+        pollStatus: `/api/exec/${job.id}/status`,
+        pollOutput: `/api/exec/${job.id}/output?offset=0`,
+      }, corsHeaders(req));
     }
+
+    // ---- 同步模式：requestId 幂等（缓存重放 + 在途合并），代理重试不会重复执行 ----
+    const runSync = async () => {
+      const timeoutMs = Math.min(Number(body.timeoutMs) || 15000, 120000);
+      const session = createExecSession();
+      const startedAt = Date.now();
+      let spawnError = '';
+      const onError = (msg) => {
+        if (!spawnError) spawnError = String(msg);
+      };
+      session.on('error', onError);
+      let result;
+      try {
+        result = await waitForOutput(session, {
+          since: 0,
+          waitMs: timeoutMs,
+          quietMs: 0,
+          mustExit: true,
+        });
+      } finally {
+        session.removeListener('error', onError);
+      }
+      if (result.timedOut) {
+        escalateKill(session);
+        await new Promise((r) => setTimeout(r, 400));
+      }
+      if (spawnError && session.exitCode === null && !String(result.data || '').length) {
+        removeSession(session.id);
+        const err = new Error(`exec spawn failed: ${spawnError.slice(0, 200)}`);
+        err.status = 500;
+        err.code = 'spawn_failed';
+        throw err;
+      }
+      const payload = buildExecPayload({ id: session.id, requestId, session, label: cmdLabel, startedAt }, result);
+      if (!body.keep) setTimeout(() => removeSession(session.id), 50).unref();
+      return payload;
+    };
+
+    if (!requestId) {
+      const payload = await runSync();
+      if (body.keep) {
+        return sendJson(res, 200, { ...payload, kept: true }, corsHeaders(req));
+      }
+      return sendJson(res, 200, payload, corsHeaders(req));
+    }
+    const { payload, cached } = await execDedupe(`exec:${requestId}`, runSync);
+    if (body.keep) {
+      return sendJson(res, 200, { ...payload, kept: true, cached: cached || undefined }, corsHeaders(req));
+    }
+    return sendJson(res, 200, { ...payload, cached: cached || undefined }, corsHeaders(req));
+  }
+
+  const execJobMatch = pathname.match(/^\/api\/exec\/([^/]+)(\/(status|output))?$/);
+  if (execJobMatch && method === 'GET') {
+    if (!need('exec')) return;
+    const job = execJobs.get(decodeURIComponent(execJobMatch[1]));
+    if (!job) {
+      return sendError(res, req, 404, 'exec_not_found', `exec job not found (or expired): ${execJobMatch[1]}`);
+    }
+    const action = execJobMatch[3] || 'status';
+    const session = job.session;
+    if (action === 'status') {
+      const base = {
+        execId: job.id,
+        requestId: job.requestId || undefined,
+        commandLabel: job.label,
+        status: execJobStatus(job),
+        timedOut: job.finished ? Boolean(job.payload.timedOut) : false,
+        exitCode: job.finished ? job.payload.exitCode : null,
+        startedAt: job.startedAt,
+        timeoutMs: job.timeoutMs,
+        bytesTotal: session.buffer.length,
+        durationMs: job.finished ? job.payload.durationMs : Date.now() - job.startedAt,
+      };
+      if (job.finished && job.payload.error) {
+        base.error = job.payload.error;
+        base.detail = job.payload.detail;
+      }
+      return sendJson(res, 200, base, corsHeaders(req));
+    }
+    // action === 'output'
+    const offsetRaw = Number(url.searchParams.get('offset') || 0);
+    const bufferStart = session.trimmedChars;
+    const requested = Math.max(0, offsetRaw - bufferStart);
+    const start = Math.min(Math.max(0, requested), session.buffer.length);
+    // 清洗 CSI/CR，但不做边缘裁剪：offset 坐标以缓冲区为准，客户端始终回传服务端返回的 offset
+    const data = stripAnsi(session.buffer.slice(start)).replace(/\r\n/g, '\n').replace(/\r/g, '');
+    return sendJson(res, 200, {
+      execId: job.id,
+      status: execJobStatus(job),
+      exitCode: job.finished ? job.payload.exitCode : null,
+      timedOut: job.finished ? Boolean(job.payload.timedOut) : false,
+      truncated: !job.finished,
+      truncatedReason: !job.finished ? 'running' : job.payload.truncatedReason,
+      bufferStart,
+      offset: bufferStart + session.buffer.length,
+      bytesTotal: session.buffer.length,
+      bytesReturned: Buffer.byteLength(data),
+      data,
+    }, corsHeaders(req));
+  }
+
+  if (execJobMatch && method === 'DELETE') {
+    if (!need('exec')) return;
+    const job = execJobs.get(decodeURIComponent(execJobMatch[1]));
+    if (!job) {
+      return sendError(res, req, 404, 'exec_not_found', `exec job not found (or expired): ${execJobMatch[1]}`);
+    }
+    if (!job.finished) {
+      escalateKill(job.session);
+      job.finished = true;
+      job.payload = {
+        execId: job.id,
+        requestId: job.requestId || undefined,
+        commandLabel: job.label,
+        status: 'killed',
+        exitCode: 124,
+        output: cleanExecOutput(stripAnsi(job.session.buffer)),
+        truncated: true,
+        truncatedReason: 'killed',
+        timedOut: false,
+        killed: true,
+        bytesTotal: job.session.buffer.length,
+        durationMs: Date.now() - job.startedAt,
+      };
+      job.finishedAt = Date.now();
+      manager.remove(job.id);
+    }
+    return sendJson(res, 200, { ok: true, execId: job.id, status: execJobStatus(job) }, corsHeaders(req));
+  }
+
+  if (pathname === '/api/files' && (method === 'PUT' || method === 'POST' || method === 'GET')) {
+    if (!need('exec')) return;
+    const fp = url.searchParams.get('path');
+    if (!fp || !path.isAbsolute(fp)) {
+      return sendError(res, req, 400, 'bad_request', 'query parameter path (absolute) is required');
+    }
+    if (method === 'PUT' || method === 'POST') {
+      let buf;
+      try {
+        buf = await readRaw(req, settings.uploadMaxBytes);
+      } catch (err) {
+        return sendError(res, req, err.status || 500, err.status === 413 ? 'payload_too_large' : 'upload_failed', err.message);
+      }
+      try {
+        fs.mkdirSync(path.dirname(fp), { recursive: true });
+        const tmp = `${fp}.aitb-tmp-${crypto.randomBytes(4).toString('hex')}`;
+        fs.writeFileSync(tmp, buf, { mode: 0o644 });
+        fs.renameSync(tmp, fp);
+      } catch (err) {
+        return sendError(res, req, 500, 'write_failed', String(err.message || err));
+      }
+      audit.add({ kind: 'file_upload', actor: actorOf(auth), ip: req.socket.remoteAddress || 'unknown', detail: `${fp} ${buf.length}B` });
+      return sendJson(res, 200, { ok: true, path: fp, bytes: buf.length, sha256: sha256(buf) }, corsHeaders(req));
+    }
+    let st;
+    try {
+      st = fs.statSync(fp);
+    } catch {
+      return sendError(res, req, 404, 'file_not_found', `file not found: ${fp}`);
+    }
+    if (st.isDirectory()) {
+      return sendError(res, req, 400, 'is_directory', `path is a directory: ${fp}`);
+    }
+    if (st.size > settings.uploadMaxBytes) {
+      return sendError(res, req, 413, 'payload_too_large', `file exceeds ${settings.uploadMaxBytes} bytes`);
+    }
+    const buf = fs.readFileSync(fp);
+    res.writeHead(200, {
+      'content-type': 'application/octet-stream',
+      'content-length': buf.length,
+      'x-aitb-sha256': sha256(buf),
+      'cache-control': 'no-store',
+      ...corsHeaders(req),
+    });
+    return res.end(buf);
   }
 
   if (pathname === '/api/sessions/purge' && method === 'POST') {
@@ -757,32 +1080,35 @@ async function handleApi(req, res, url) {
     if (action === '/exec' && method === 'POST') {
       const body = await readBody(req);
       if (!body.command || typeof body.command !== 'string') {
-        return sendJson(res, 400, { error: 'command is required' }, corsHeaders(req));
+        return sendError(res, req, 400, 'bad_request', 'command is required');
       }
-      if (body.requestId) {
-        const cached = execCacheGet(session.id, body.requestId);
-        if (cached) {
-          return sendJson(res, 200, { ...cached, cached: true }, corsHeaders(req));
-        }
-      }
-      const baseline = session.buffer.length;
-      const sent = body.command.replace(/\r?\n$/, '') + '; printf \'\\n__AITB_EC=%s__\\n\' "$?"';
-      session.write(sent + '\r');
-      markOperator(id, actorOf(auth));
-      const waitMs = Math.min(Number(body.timeoutMs) || 30000, 120000);
-      const result = await waitForSentinel(session, baseline, waitMs);
-      let output = stripEcho(result.before, sent);
-      if (result.found) output = output.replace(/^\r?\n/, '').replace(/\r?\n$/, '');
-      const payload = {
-        sessionId: session.id,
-        offset: session.buffer.length,
-        output: cleanExecOutput(output),
-        alive: session.alive,
-        exitCode: result.found ? result.exitCode : null,
-        truncated: !result.found,
+      const requestId = body.requestId ? String(body.requestId).slice(0, 128) : '';
+      const runSessionExec = async () => {
+        const baseline = session.buffer.length;
+        const sent = body.command.replace(/\r?\n$/, '') + '; printf \'\\n__AITB_EC=%s__\\n\' "$?"';
+        session.write(sent + '\r');
+        markOperator(id, actorOf(auth));
+        const waitMs = Math.min(Number(body.timeoutMs) || 30000, 120000);
+        const result = await waitForSentinel(session, baseline, waitMs);
+        let output = stripEcho(result.before, sent);
+        if (result.found) output = output.replace(/^\r?\n/, '').replace(/\r?\n$/, '');
+        return {
+          sessionId: session.id,
+          requestId: requestId || undefined,
+          offset: session.buffer.length,
+          output: cleanExecOutput(output),
+          alive: session.alive,
+          exitCode: result.found ? result.exitCode : null,
+          truncated: !result.found,
+          truncatedReason: result.found ? undefined : 'timeout',
+          timedOut: !result.found,
+        };
       };
-      if (body.requestId) execCachePut(session.id, body.requestId, payload);
-      return sendJson(res, 200, payload, corsHeaders(req));
+      if (!requestId) {
+        return sendJson(res, 200, await runSessionExec(), corsHeaders(req));
+      }
+      const { payload, cached } = await execDedupe(`sexec:${session.id}:${requestId}`, runSessionExec);
+      return sendJson(res, 200, { ...payload, cached: cached || undefined }, corsHeaders(req));
     }
 
     if (action === '/kill' && method === 'POST') {
@@ -834,7 +1160,8 @@ const server = http.createServer((req, res) => {
   if (url.pathname.startsWith('/api/')) {
     handleApi(req, res, url).catch((err) => {
       const status = err.status || 500;
-      sendJson(res, status, { error: err.message || 'internal error' }, corsHeaders(req));
+      const code = err.code || (status === 500 ? 'internal_error' : 'request_failed');
+      sendJson(res, status, { error: err.message || 'internal error', code }, corsHeaders(req));
     });
     return;
   }

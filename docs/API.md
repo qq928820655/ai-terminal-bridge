@@ -188,15 +188,15 @@ WebSocket 同样支持按名接入：`/ws?token=<token>&name=ai-work`，会话�
 
 ### POST /api/sessions/:id/exec
 
-在指定会话里执行一条命令并等待输出。body：`command`、可选 `timeoutMs`（默认 30s，最大 120s）。
+在指定会话里执行一条命令并等待输出。body：`command`、可选 `timeoutMs`（默认 30s，最大 120s）、可选 `requestId`（幂等键，同会话同 requestId 重放缓存结果并回显）。
 
-实现：命令尾部自动追加退出码哨兵，服务端读到哨兵才返回——**真实 `exitCode`、输出不含命令回显、CRLF 已归一化为 LF**。超时未读到哨兵时 `truncated:true` 且 `exitCode:null`（命令还在跑，未跑完）。
+实现：命令尾部自动追加退出码哨兵，服务端读到哨兵才返回——**真实 `exitCode`、输出不含命令回显、CRLF 已归一化为 LF**。超时未读到哨兵时 `truncated:true`、`timedOut:true`、`truncatedReason:"timeout"` 且 `exitCode:null`（命令还在跑，未跑完）。
 
 ```bash
 curl -s -X POST "$BASE/api/sessions/$SID/exec" \
   -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" \
   -d '{"command":"git status --short"}'
-# {"sessionId":"s_x","offset":123,"output":" M file\n","alive":true,"exitCode":0,"truncated":false}
+# {"sessionId":"s_x","requestId":null,"offset":123,"output":" M file\n","alive":true,"exitCode":0,"truncated":false}
 ```
 
 ### POST /api/sessions/purge?ephemeral=1
@@ -222,18 +222,85 @@ curl -s -X POST "$BASE/api/sessions/purge?ephemeral=1" -H "Authorization: Bearer
 
 ### POST /api/exec
 
-一次性执行：自动建会话跑命令、收输出、自动销毁（`keep:true` 可保留会话）。需要 `exec` scope。
+一次性执行：自动建会话跑命令、收输出、自动销毁。需要 `exec` scope。
 
-- 会话标记 `ephemeral:true`，客户端断连或 30s 硬超时都会强制回收，不会泄漏占额度
-- 自动命名 `exec:<命令前 20 字符>`，`/api/sessions` 列表可见 `ephemeral` 字段
-- `quietMs`（静默判定兜底）默认 1000ms；响应带 `truncated` 标记
+**请求体：**
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `command` | string | 必填。由 `bash -c` 执行 |
+| `timeoutMs` | number | 超时上限，默认 15000，同步模式最大 120000；detach 模式最大 `AITB_EXEC_MAX_MS`（默认 10 分钟） |
+| `requestId` | string | 可选，≤128 字符。**幂等键**：同 requestId 的重放返回缓存结果（`cached:true`），不会重复执行；并发重复请求合并为一次执行 |
+| `detach` | boolean | true 时立即返回 `execId`，用 status/output 接口拉取，见下文 |
+| `cwd` / `shell` / `cols` / `rows` / `keep` | - | 同会话参数；`keep:true` 保留会话不销毁 |
+
+**响应（同步模式）：**
+
+```json
+{
+  "execId": "s8c9d523f1b52",
+  "requestId": "dq-001",
+  "commandLabel": "echo MARK_$RANDOM >>",
+  "status": "exited",
+  "exitCode": 0,
+  "output": "...",
+  "truncated": false,
+  "timedOut": false,
+  "killed": false,
+  "bytesReturned": 1,
+  "bytesTotal": 3,
+  "durationMs": 41,
+  "cached": true
+}
+```
+
+- `exitCode`：真实退出码；**超时被杀时是 `124`**（不再返回 null），配合 `timedOut:true`
+- `truncatedReason`：截断原因，`timeout`（超时强杀）或 `killed`（手动 DELETE）
+- `output` 已清洗 ANSI/CR，无回显污染
+- 客户端断连**不会**杀掉正在执行的命令（跑完为止）；`timeoutMs` 到点才杀
+- 超时先对命令发 SIGTERM（给脚本 trap 清理的机会），随后强杀
+
+**detach 模式（长任务推荐）：**
 
 ```bash
-curl -s -X POST "$BASE/api/exec" \
-  -H "Authorization: Bearer qq928820655" -H "content-type: application/json" \
-  -d '{"command":"node -v && pwd"}'
-# {"exitCode":0,"output":"v22.22.0\n/workspace","truncated":false}
+# 1. 发起，立即返回
+curl -s -X POST "$BASE/api/exec" -H "Authorization: Bearer $T" \
+  -H "content-type: application/json" \
+  -d '{"command":"./deploy.sh","detach":true,"timeoutMs":600000}'
+# {"execId":"sf656018120b8","detached":true,"status":"running",
+#  "pollStatus":"/api/exec/sf656018120b8/status","pollOutput":"/api/exec/.../output?offset=0"}
+
+# 2. 轮询状态
+curl -s "$BASE/api/exec/$ID/status" -H "Authorization: Bearer $T"
+# {"execId":"...","status":"running"|"exited"|"timeout"|"killed"|"failed",
+#  "exitCode":null,"timedOut":false,"durationMs":2131,"bytesTotal":10,...}
+
+# 3. 增量拉输出（offset 传上次响应里的 offset；服务端已清洗 CR/ANSI）
+curl -s "$BASE/api/exec/$ID/output?offset=0" -H "Authorization: Bearer $T"
+# {"status":"exited","exitCode":0,"data":"P_A\nP_B\n","offset":10,
+#  "bytesTotal":10,"bytesReturned":10,"truncated":false,"bufferStart":0}
+
+# 4. 中途终止（可选）
+curl -s -X DELETE "$BASE/api/exec/$ID" -H "Authorization: Bearer $T"
 ```
+
+已结束的 detach 任务保留 10 分钟（`AITB_EXEC_TTL_MS`）供查询，之后自动清理。任务从会话列表摘除，不占用 UI 会话位。
+
+### PUT /api/files?path=<绝对路径>
+
+上传文件（需要 `exec` scope）。body 为原始字节，上限 10MB（`AITB_UPLOAD_MAX_BYTES`）。父目录自动创建；写入为「临时文件 + rename」原子落盘。
+
+```bash
+curl -s -X PUT "$BASE/api/files?path=/tmp/pkg.tar.gz" \
+  -H "Authorization: Bearer $T" \
+  -H "content-type: application/octet-stream" \
+  --data-binary @pkg.tar.gz
+# {"ok":true,"path":"/tmp/pkg.tar.gz","bytes":413696,"sha256":"090c..."}
+```
+
+### GET /api/files?path=<绝对路径>
+
+下载文件。响应头带 `x-aitb-sha256`，可直接比对校验。404 返回 `{"error":"file not found","code":"file_not_found"}`。
 
 ### GET /api/health
 
@@ -288,16 +355,52 @@ sleep 1
 curl -s "$BASE/api/sessions/$SID" -H "Authorization: Bearer $T"
 ```
 
-## 8. 速率与限制
+## 8. 客户端注意事项（实测踩坑记录）
+
+### 8.1 Python urllib / requests 被 403 拦截
+
+预览域名的 Cloudflare 层按 User-Agent 签名拦截（`error code: 1010`），`Python-urllib/3.x` 默认 UA 会被 403，请求**到不了桥**。加一个普通 UA 即可：
+
+```python
+headers = {
+    "Authorization": "Bearer " + TOK,
+    "User-Agent": "aitb-client/1.0",   # 任意非 Python-urllib UA
+    "content-type": "application/json",
+}
+```
+
+### 8.2 curl 传 JSON body 的唯一正确姿势
+
+```bash
+# 正确：--data-binary @file 或 -d '<json>'
+curl -X POST "$BASE/api/exec" -H "Authorization: Bearer $T" \
+  -H "content-type: application/json" --data-binary @body.json
+
+# 错误：-F body.json（multipart 表单，本服务不解析）
+```
+
+内联 JSON 含中文/引号时建议落成文件再 `--data-binary @file`。
+
+### 8.3 调用方建议
+
+1. **所有 `/api/exec` 都带 `requestId`**（uuid 即可）：代理层重试不会产生重复副作用，回包可一一对应，响应里会回显 `requestId` + `cached` 标记。
+2. **超过 ~10s 的命令用 detach 模式**：发起请求毫秒级返回，不存在长连接被代理掐断的问题；轮询 status/output 都是幂等 GET。
+3. **超时判断看 `timedOut` + `exitCode=124`**，不要再拿 `exitCode:null` 猜。
+4. `output` 已清洗回显/ANSI/CR，但 detach 的 `output` 接口返回的是**清洗后增量**，翻页永远传服务端返回的 `offset`，不要自己用 bytesReturned 累加。
+
+## 9. 速率与限制
 
 | 项 | 值 |
 |---|---|
 | 最大并发会话 | 8（`AITB_MAX_SESSIONS`） |
 | 会话空闲回收 | 30 分钟 |
-| ephemeral 会话回收 | 客户端断连立即回收 + 完成后 30s 硬超时 |
+| ephemeral 会话回收 | 完成后 50ms 回收；命令本身跑满 `timeoutMs` 才杀 |
 | 滚动缓冲区 | 2 MB / 会话 |
 | 令牌最大有效期 | 30 天 |
 | 登录失败锁定 | 10 分钟内 8 次失败锁 1 分钟 |
-| /api/exec 超时 | 默认 15s，最大 120s |
-| 会话 exec 超时 | 默认 30s，最大 120s，超时返回 `truncated:true` |
+| /api/exec 同步超时 | 默认 15s，最大 120s；超时 `exitCode=124` + `timedOut:true` |
+| /api/exec detach 超时 | 默认 15s，最大 10 分钟（`AITB_EXEC_MAX_MS`） |
+| detach 任务保留 | 10 分钟（`AITB_EXEC_TTL_MS`） |
+| 文件上传/下载 | 单文件 10MB（`AITB_UPLOAD_MAX_BYTES`） |
+| 会话 exec 超时 | 默认 30s，最大 120s，超时返回 `timedOut:true` + `truncatedReason:"timeout"` |
 | 审计日志保留 | 30 天（每小时自动清理） |

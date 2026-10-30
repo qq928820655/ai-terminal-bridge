@@ -229,6 +229,7 @@ class SessionManager {
     if (alive.length >= this.maxSessions) {
       const err = new Error(`session limit reached (${this.maxSessions})`);
       err.status = 429;
+      err.code = 'session_limit';
       throw err;
     }
     const id = options.id || randomId('s');
