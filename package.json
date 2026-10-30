@@ -1,0 +1,36 @@
+{
+  "name": "ai-terminal-bridge",
+  "version": "1.0.0",
+  "description": "Expose a host terminal to external AI agents over HTTP, WebSocket and MCP.",
+  "main": "src/server.js",
+  "directories": {
+    "test": "test"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "keywords": [
+    "terminal",
+    "ai",
+    "mcp",
+    "pty",
+    "agent"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/xterm": "^5.5.0",
+    "ws": "^8.22.0"
+  },
+  "bin": {
+    "aitb": "bin/aitb.js",
+    "aitb-mcp": "bin/aitb-mcp.js",
+    "aitb-server": "src/server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

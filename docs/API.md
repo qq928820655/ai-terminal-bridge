@@ -1,0 +1,287 @@
+# AI Terminal Bridge API 接口文档
+
+把宿主机终端通过 HTTP / WebSocket / MCP 暴露给外部 AI 代理使用。
+
+## 1. 服务地址
+
+| 环境 | 地址 |
+|---|---|
+| 预览（公网） | `https://8790-35521e1ac3aed563.monkeycode-ai.live` |
+| 本机 | `http://localhost:8790` |
+
+下文示例统一用预览地址，`$BASE` 即：
+
+```bash
+BASE="https://8790-35521e1ac3aed563.monkeycode-ai.live"
+```
+
+## 2. 认证
+
+两种凭据，任选其一：
+
+### 2.1 API 令牌（推荐给程序/AI 代理）
+
+初始 bootstrap 令牌：`qq928820655`（由 `AITB_TOKEN` 配置，永久有效，admin 权限）。
+
+也可在 Web 界面「令牌管理」创建托管令牌（`aitb_` 开头，可限定 scope 和有效期）。
+
+令牌传入方式（按优先级）：
+
+```
+Authorization: Bearer <token>        # 标准
+X-AITB-Token: <token>                # 头字段
+GET /api/sessions?token=<token>      # 查询参数（WebSocket 用这种方式）
+Cookie: aitb_token=<token>           # Cookie
+```
+
+```bash
+curl -s "$BASE/api/sessions" -H "Authorization: Bearer qq928820655"
+```
+
+### 2.2 账号会话（给 Web 界面 / 人）
+
+默认账号 `admin`，初始密码等于 bootstrap 令牌值，首次登录强制改密。
+
+```bash
+# 登录，拿会话令牌（有效期 7 天）
+curl -s -X POST "$BASE/api/auth/login" \
+  -H "content-type: application/json" \
+  -d '{"username":"admin","password":"<你的密码>"}'
+# 返回 {"sessionToken":"sess_...","mustChangePassword":false}
+```
+
+会话令牌用法与 API 令牌相同（放 `Authorization: Bearer sess_...`）。
+
+### 2.3 权限 scope
+
+| scope | 能力 |
+|---|---|
+| `exec` | 执行命令（/api/exec、/api/sessions/:id/exec） |
+| `session` | 终端会话管理（列表、创建、WS 交互） |
+| `admin` | 令牌管理（创建/轮换/删除/查看完整值），含前两者能力 |
+
+账号登录的会话具有 admin；托管令牌按创建时指定的 scope 生效。
+
+## 3. 认证接口
+
+### POST /api/auth/login
+
+登录。密码字段可填账号密码，也可填任一托管 API 令牌（bootstrap 值不能当密码登录）。10 分钟内失败 8 次锁定 1 分钟。
+
+```bash
+curl -s -X POST "$BASE/api/auth/login" \
+  -H "content-type: application/json" \
+  -d '{"username":"admin","password":"xxx"}'
+```
+
+响应：`{ "sessionToken": "sess_...", "mustChangePassword": true, "account": {...} }`
+
+### GET /api/auth/me
+
+当前身份。需要认证。
+
+```bash
+curl -s "$BASE/api/auth/me" -H "Authorization: Bearer $TOKEN"
+# {"kind":"session","username":"admin","scopes":["exec","session","admin"],...}
+```
+
+### POST /api/auth/password
+
+修改密码。`newPassword` 允许与当前密码相同。需要认证。
+
+```bash
+curl -s -X POST "$BASE/api/auth/password" \
+  -H "Authorization: Bearer $SESS" -H "content-type: application/json" \
+  -d '{"username":"admin","currentPassword":"old","newPassword":"new"}'
+```
+
+### POST /api/auth/logout
+
+注销当前会话。需要认证。
+
+## 4. 令牌管理（需 admin）
+
+### GET /api/tokens
+
+列出托管令牌（只含掩码）。
+
+### POST /api/tokens
+
+创建令牌。字段全可选：`name`、`scopes`（默认 `["exec","session"]`）、`token`（自定义值 8-128 字符，留空随机）、有效期 `ttlMs` / `expiresAt`（最大 30 天，缺省永久）。
+
+```bash
+# 创建 2 小时有效的临时令牌
+curl -s -X POST "$BASE/api/tokens" \
+  -H "Authorization: Bearer qq928820655" -H "content-type: application/json" \
+  -d '{"name":"agent-2h","scopes":["exec"],"ttlMs":7200000}'
+# 响应里的 token.token 是完整值，仅此一次返回
+```
+
+### GET /api/tokens/:id/reveal
+
+取回某个托管令牌的完整值（此后随时可查，不再只显示一次）。
+
+```bash
+curl -s "$BASE/api/tokens/tok_xxxx/reveal" -H "Authorization: Bearer qq928820655"
+```
+
+### POST /api/tokens/:id/rotate
+
+轮换（生成新值，旧值立即失效）。响应含新完整值。
+
+### POST /api/tokens/:id/rename
+
+改名。body：`{"name":"新名字"}`
+
+### POST /api/tokens/:id/value
+
+自定义令牌值。body：`{"token":"aitb_myvalue"}`
+
+### POST /api/tokens/:id/disable · /enable
+
+停用 / 启用。
+
+### DELETE /api/tokens/:id
+
+删除令牌。
+
+## 5. 终端会话（需 session scope）
+
+### GET /api/sessions
+
+列出所有会话。
+
+### POST /api/sessions
+
+创建交互式 shell 会话。body 可选：`cwd`、`shell`、`cols`、`rows`、`name`。
+
+```bash
+curl -s -X POST "$BASE/api/sessions" \
+  -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" \
+  -d '{"cwd":"/workspace"}'
+# {"session":{"id":"s1a2b3c4d5e6",...}}
+```
+
+### GET /api/sessions/:id
+
+会话快照（含滚动缓冲区）。参数：`offset`（从该字符数之后取）、`strip=0`（保留 ANSI 转义，默认剥离）。
+
+### POST /api/sessions/:id/input
+
+向会话写入输入（模拟键盘）。body：`{"data":"ls -la\r"}`
+
+### POST /api/sessions/:id/exec
+
+在指定会话里执行一条命令并等待输出。body：`command`、可选 `timeoutMs`（默认 30s，最大 120s）。
+
+实现：命令尾部自动追加退出码哨兵，服务端读到哨兵才返回——**真实 `exitCode`、输出不含命令回显、CRLF 已归一化为 LF**。超时未读到哨兵时 `truncated:true` 且 `exitCode:null`（命令还在跑，未跑完）。
+
+```bash
+curl -s -X POST "$BASE/api/sessions/$SID/exec" \
+  -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" \
+  -d '{"command":"git status --short"}'
+# {"sessionId":"s_x","offset":123,"output":" M file\n","alive":true,"exitCode":0,"truncated":false}
+```
+
+### POST /api/sessions/purge?ephemeral=1
+
+批量清理会话。默认只清 ephemeral（`/api/exec` 一次性会话）；`?ephemeral=0` 清理全部。
+
+```bash
+curl -s -X POST "$BASE/api/sessions/purge?ephemeral=1" -H "Authorization: Bearer $TOKEN"
+# {"ok":true,"removed":["s_x","s_y"]}
+```
+
+### POST /api/sessions/:id/resize
+
+调整终端尺寸。body：`{"cols":120,"rows":32}`
+
+### POST /api/sessions/:id/kill
+
+结束会话进程（会话保留在列表，进程退出）。
+
+### DELETE /api/sessions/:id
+
+删除会话。
+
+### POST /api/exec
+
+一次性执行：自动建会话跑命令、收输出、自动销毁（`keep:true` 可保留会话）。需要 `exec` scope。
+
+- 会话标记 `ephemeral:true`，客户端断连或 30s 硬超时都会强制回收，不会泄漏占额度
+- 自动命名 `exec:<命令前 20 字符>`，`/api/sessions` 列表可见 `ephemeral` 字段
+- `quietMs`（静默判定兜底）默认 1000ms；响应带 `truncated` 标记
+
+```bash
+curl -s -X POST "$BASE/api/exec" \
+  -H "Authorization: Bearer qq928820655" -H "content-type: application/json" \
+  -d '{"command":"node -v && pwd"}'
+# {"exitCode":0,"output":"v22.22.0\n/workspace","truncated":false}
+```
+
+### GET /api/health
+
+健康检查（无需认证）。
+
+## 6. WebSocket 终端
+
+```
+wss://8790-35521e1ac3aed563.monkeycode-ai.live/ws?token=<token>&session=<id可选>&offset=<n可选>
+```
+
+- 不带 `session` 参数时自动创建新会话
+- 需要 `session` scope；认证失败返回 HTTP 401
+
+消息协议（JSON 单条文本帧）：
+
+| 方向 | 消息 |
+|---|---|
+| 客户端 → 服务端 | `{"type":"input","data":"ls\r"}` |
+| 客户端 → 服务端 | `{"type":"resize","cols":120,"rows":32}` |
+| 客户端 → 服务端 | `{"type":"ping"}` |
+| 客户端 → 服务端 | `{"type":"kill"}` |
+| 服务端 → 客户端 | `{"type":"snapshot","session":{...},"data":"...","offset":n}` 连接建立时 |
+| 服务端 → 客户端 | `{"type":"output","data":"..."}` PTY 输出 |
+| 服务端 → 客户端 | `{"type":"exit","code":0}` 进程退出 |
+| 服务端 → 客户端 | `{"type":"error","message":"..."}` |
+| 服务端 → 客户端 | `{"type":"pong","t":...}` |
+
+Web 界面已内置 25 秒心跳和断线自动重连（1.5s 后重连当前会话）。
+
+## 7. 快速上手示例
+
+```bash
+BASE="https://8790-35521e1ac3aed563.monkeycode-ai.live"
+T="qq928820655"
+
+# 健康检查
+curl -s "$BASE/api/health"
+
+# 执行一条命令
+curl -s -X POST "$BASE/api/exec" \
+  -H "Authorization: Bearer $T" -H "content-type: application/json" \
+  -d '{"command":"uname -a"}'
+
+# 建会话 + 写命令 + 取输出
+SID=$(curl -s -X POST "$BASE/api/sessions" -H "Authorization: Bearer $T" \
+  -H "content-type: application/json" -d '{}' | python3 -c "import sys,json;print(json.load(sys.stdin)['session']['id'])")
+curl -s -X POST "$BASE/api/sessions/$SID/input" \
+  -H "Authorization: Bearer $T" -H "content-type: application/json" \
+  -d '{"data":"echo hello from bridge\r"}'
+sleep 1
+curl -s "$BASE/api/sessions/$SID" -H "Authorization: Bearer $T"
+```
+
+## 8. 速率与限制
+
+| 项 | 值 |
+|---|---|
+| 最大并发会话 | 8（`AITB_MAX_SESSIONS`） |
+| 会话空闲回收 | 30 分钟 |
+| ephemeral 会话回收 | 客户端断连立即回收 + 完成后 30s 硬超时 |
+| 滚动缓冲区 | 2 MB / 会话 |
+| 令牌最大有效期 | 30 天 |
+| 登录失败锁定 | 10 分钟内 8 次失败锁 1 分钟 |
+| /api/exec 超时 | 默认 15s，最大 120s |
+| 会话 exec 超时 | 默认 30s，最大 120s，超时返回 `truncated:true` |
+| 审计日志保留 | 30 天（每小时自动清理） |

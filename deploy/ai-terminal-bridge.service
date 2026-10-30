@@ -1,0 +1,19 @@
+[Unit]
+Description=AI Terminal Bridge - expose host terminal to AI agents
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/workspace/ai-terminal-bridge
+ExecStart=/usr/bin/node /workspace/ai-terminal-bridge/src/server.js
+Restart=always
+RestartSec=3
+Environment=NODE_ENV=production
+Environment=AITB_HOST=0.0.0.0
+Environment=AITB_PORT=8787
+Environment=AITB_TOKEN=__REPLACE_WITH_TOKEN__
+NoNewPrivileges=no
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

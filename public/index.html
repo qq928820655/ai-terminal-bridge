@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>AI Terminal Bridge</title>
+<link rel="stylesheet" href="/vendor/xterm.css" />
+<link rel="stylesheet" href="/style.css?v=12" />
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <div class="brand">
+      <div class="logo">AI</div>
+      <div>
+        <div class="title">Terminal Bridge</div>
+        <div class="sub" id="connState">未连接</div>
+      </div>
+    </div>
+
+    <section id="authPanel">
+      <div id="loginView" class="panel-form">
+        <div class="doc-title">登录</div>
+        <input id="loginUser" type="text" placeholder="用户名" value="admin" autocomplete="username" />
+        <input id="loginPass" type="password" placeholder="密码 / 登录令牌" autocomplete="current-password" />
+        <button id="loginBtn" class="primary">登录</button>
+        <div class="err" id="loginErr"></div>
+      </div>
+      <div id="userView" class="hidden">
+        <div class="user-row">
+          <div class="avatar" id="userAvatar">?</div>
+          <div class="user-meta">
+            <div class="user-name" id="whoami">未登录</div>
+            <div class="user-kind" id="userKind"></div>
+          </div>
+        </div>
+        <div class="user-acts">
+          <button id="btnChangePass">修改密码</button>
+          <button id="btnLogout">退出登录</button>
+        </div>
+        <div id="passView" class="panel-form hidden">
+          <div class="doc-title" id="passTitle">修改密码</div>
+          <div class="note hidden" id="passNote">首次登录，必须设置新密码后才能继续使用</div>
+          <input id="passOld" type="password" placeholder="当前密码" autocomplete="current-password" />
+          <input id="passNew" type="password" placeholder="新密码（至少 6 位）" autocomplete="new-password" />
+          <input id="passNew2" type="password" placeholder="确认新密码" autocomplete="new-password" />
+          <div class="user-acts">
+            <button id="passSave" class="primary">保存新密码</button>
+            <button id="passCancel">取消</button>
+          </div>
+          <div class="err" id="passErr"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="sessionPanel" class="hidden">
+      <div class="actions">
+        <button id="newSession" class="primary">新建终端</button>
+        <button id="refreshSessions">刷新</button>
+      </div>
+      <ul id="sessionList"></ul>
+    </section>
+
+    <section id="tokenPanel" class="hidden">
+      <div class="doc-title">令牌管理</div>
+      <div class="token-form">
+        <input id="tfName" type="text" placeholder="备注名称" autocomplete="off" />
+        <div class="row">
+          <select id="tfKind">
+            <option value="static">固定令牌</option>
+            <option value="ephemeral">临时令牌</option>
+          </select>
+          <input id="tfTtl" type="text" placeholder="有效期 如 30m/2h/7d" autocomplete="off" />
+        </div>
+        <input id="tfValue" type="text" placeholder="自定义令牌值（留空随机生成）" autocomplete="off" />
+        <button id="tfCreate" class="primary">创建令牌</button>
+      </div>
+      <ul id="tokenList"></ul>
+      <div class="hint" id="tokenHint"></div>
+    </section>
+
+    <section id="auditPanel" class="hidden">
+      <div class="doc-title-row">
+        <div class="doc-title">访问记录</div>
+        <button id="btnAudit" class="linkish">查看</button>
+      </div>
+      <div class="hint" id="auditHint">保留 30 天，超期自动清理</div>
+    </section>
+
+    <div id="docPanel" class="doc hidden">
+      <div class="doc-title-row">
+        <div class="doc-title">API 快速接入</div>
+        <button id="btnApiDoc" class="linkish">接口文档</button>
+      </div>
+      <pre id="apiSnippet">POST /api/exec
+Authorization: Bearer &lt;token&gt;
+{"command":"ls -la"}</pre>
+    </div>
+  </aside>
+  <main id="main">
+    <div id="terminal"></div>
+    <div id="empty">登录后可使用终端</div>
+  </main>
+</div>
+<div id="docModal" class="overlay hidden">
+  <div class="doc-window">
+    <div class="doc-window-head">
+      <span class="doc-window-title">API 接口文档</span>
+      <span class="doc-window-acts">
+        <button id="docCopyAll">复制全文</button>
+        <button id="docClose">关闭</button>
+      </span>
+    </div>
+    <div class="doc-window-body" id="docBody"></div>
+  </div>
+</div>
+<div id="auditModal" class="overlay hidden">
+  <div class="doc-window">
+    <div class="doc-window-head">
+      <span class="doc-window-title">终端访问记录</span>
+      <span class="doc-window-acts">
+        <span class="live-dot" id="auditLive" title="实时刷新中"></span>
+        <button id="auditRefresh">刷新</button>
+        <button id="auditClose">关闭</button>
+      </span>
+    </div>
+    <div class="doc-window-body">
+      <div class="audit-head-row">
+        <span>创建时间</span><span>创建者 / 访问者</span><span>终端</span><span>状态</span>
+      </div>
+      <ul id="auditList"></ul>
+      <div class="doc-title" style="margin-top:14px">事件流水</div>
+      <ul id="auditEvents"></ul>
+      <div class="hint" id="auditModalHint"></div>
+    </div>
+  </div>
+</div>
+<div id="termModal" class="overlay hidden">
+  <div class="doc-window">
+    <div class="doc-window-head">
+      <span class="doc-window-title" id="termIoTitle">终端详情</span>
+      <span class="doc-window-acts">
+        <button id="termIoCopy">复制全文</button>
+        <button id="termIoClose">关闭</button>
+      </span>
+    </div>
+    <div class="doc-window-body" id="termIoBody"></div>
+  </div>
+</div>
+<script src="/vendor/xterm.js"></script>
+<script src="/vendor/addon-fit.js"></script>
+<script src="/app.js?v=12"></script>
+</body>
+</html>
