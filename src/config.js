@@ -59,6 +59,7 @@ function load(envFile = path.join(__dirname, '..', '.env')) {
   const connIdlePurgeMs = num(process.env.AITB_CONN_PURGE_MS, 3 * 24 * 60 * 60 * 1000);
   const connSweepMs = num(process.env.AITB_CONN_SWEEP_MS, 60 * 1000);
   const uploadMaxBytes = int(process.env.AITB_UPLOAD_MAX_BYTES, 10 * 1024 * 1024);
+  const uploadIdleMs = int(process.env.AITB_UPLOAD_IDLE_MS, 30 * 1000);
   const execMaxMs = int(process.env.AITB_EXEC_MAX_MS, 10 * 60 * 1000);
   const execJobTtlMs = int(process.env.AITB_EXEC_TTL_MS, 10 * 60 * 1000);
   return {
@@ -74,6 +75,7 @@ function load(envFile = path.join(__dirname, '..', '.env')) {
     connIdlePurgeMs,
     connSweepMs,
     uploadMaxBytes,
+    uploadIdleMs,
     execMaxMs,
     execJobTtlMs,
     loginUser: process.env.AITB_LOGIN_USER || 'admin',

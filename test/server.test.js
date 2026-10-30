@@ -787,3 +787,141 @@ test('exec reports 127 for missing command and auth errors carry codes', async (
   assert.equal(unauth.status, 401);
   assert.equal((await unauth.json()).code, 'auth_failed');
 });
+
+// ---- v14: 反馈修复验证（字节精确输出/续传/卡死错误/超时可观测）----
+
+test('exec output is byte-exact including trailing newline', async () => {
+  const { data } = await api('POST', '/api/exec', { command: "printf 'A\\nB\\nC\\n'" });
+  assert.equal(data.output, 'A\nB\nC\n');
+  const noNL = await api('POST', '/api/exec', { command: "printf 'XY'" });
+  assert.equal(noNL.data.output, 'XY');
+});
+
+test('timeout response carries cleanupMs', async () => {
+  const { data } = await api('POST', '/api/exec', { command: 'sleep 5', timeoutMs: 1000 });
+  assert.equal(data.timedOut, true);
+  assert.equal(data.exitCode, 124);
+  assert.equal(typeof data.cleanupMs, 'number');
+  assert.equal(data.cleanupMs >= 0, true);
+});
+
+test('file upload resumes from offset', async () => {
+  const rnd = Math.random().toString(36).slice(2, 8);
+  const fp = `/tmp/aitb-resume-${rnd}.bin`;
+  const part1 = Buffer.from([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+  const part2 = Buffer.from([11, 12, 13, 14, 15]);
+  const part3 = Buffer.from([16, 17, 18]);
+
+  const r1 = await fetch(`${BASE}/api/files?path=${encodeURIComponent(fp)}`, {
+    method: 'PUT',
+    headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/octet-stream' },
+    body: part1,
+  });
+  const d1 = await r1.json();
+  assert.equal(d1.receivedBytes, 10);
+
+  const r2 = await fetch(`${BASE}/api/files?path=${encodeURIComponent(fp)}&offset=10`, {
+    method: 'PUT',
+    headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/octet-stream' },
+    body: part2,
+  });
+  const d2 = await r2.json();
+  assert.equal(d2.receivedBytes, 15);
+
+  const r3 = await fetch(`${BASE}/api/files?path=${encodeURIComponent(fp)}&offset=15`, {
+    method: 'PUT',
+    headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/octet-stream' },
+    body: part3,
+  });
+  const d3 = await r3.json();
+  assert.equal(d3.receivedBytes, 18);
+
+  const full = Buffer.concat([part1, part2, part3]);
+  const stat = await api('GET', `/api/files?path=${encodeURIComponent(fp)}&stat=1`);
+  assert.equal(stat.data.size, 18);
+
+  const got = await fetch(`${BASE}/api/files?path=${encodeURIComponent(fp)}`, {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  });
+  const body = Buffer.from(await got.arrayBuffer());
+  assert.equal(body.equals(full), true);
+  await api('POST', '/api/exec', { command: `rm -f ${fp}` });
+});
+
+test('file resume offset errors are structured', async () => {
+  const noFile = await fetch(`${BASE}/api/files?path=/tmp/aitb-noresume-${Date.now()}&offset=10`, {
+    method: 'PUT',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: 'x',
+  });
+  assert.equal(noFile.status, 409);
+  assert.equal((await noFile.json()).code, 'offset_without_file');
+
+  const rnd = Math.random().toString(36).slice(2, 8);
+  const fp = `/tmp/aitb-small-${rnd}.txt`;
+  await fetch(`${BASE}/api/files?path=${encodeURIComponent(fp)}`, {
+    method: 'PUT',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: 'abc',
+  });
+  const beyond = await fetch(`${BASE}/api/files?path=${encodeURIComponent(fp)}&offset=100`, {
+    method: 'PUT',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: 'x',
+  });
+  assert.equal(beyond.status, 409);
+  assert.equal((await beyond.json()).code, 'offset_beyond_eof');
+  await api('POST', '/api/exec', { command: `rm -f ${fp}` });
+});
+
+test('stalled upload returns 504 error instead of hanging', async () => {
+  const net = require('node:net');
+  const { spawn: spawnProc } = await import('node:child_process');
+  const port2 = 8900 + Math.floor(Math.random() * 400);
+  const child2 = spawnProc(process.execPath, [path.join(__dirname, '..', 'src', 'server.js')], {
+    env: {
+      ...process.env,
+      AITB_PORT: String(port2),
+      AITB_TOKEN: 'stall_token',
+      AITB_HOST: '127.0.0.1',
+      AITB_TOKENS_FILE: path.join(os.tmpdir(), `aitb-stall-tokens-${process.pid}-${Date.now()}.json`),
+      AITB_ACCOUNTS_FILE: path.join(os.tmpdir(), `aitb-stall-accounts-${process.pid}-${Date.now()}.json`),
+      AITB_AUDIT_FILE: path.join(os.tmpdir(), `aitb-stall-audit-${process.pid}-${Date.now()}.json`),
+      AITB_UPLOAD_IDLE_MS: '900',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('stall server start timeout')), 8000);
+    child2.stdout.on('data', (chunk) => {
+      if (chunk.toString().includes('listening')) { clearTimeout(timer); resolve(); }
+    });
+  });
+
+  try {
+    const result = await new Promise((resolve, reject) => {
+      const sock = net.connect(port2, '127.0.0.1');
+      let resp = '';
+      const timer = setTimeout(() => { sock.destroy(); reject(new Error('stall not detected in 8s')); }, 8000);
+      sock.on('data', (c) => {
+        resp += c.toString();
+        if (resp.includes('\r\n\r\n') || resp.length > 300) {
+          clearTimeout(timer);
+          sock.destroy();
+          resolve(resp);
+        }
+      });
+      sock.on('error', (e) => { clearTimeout(timer); reject(e); });
+      sock.write(
+        `PUT /api/files?path=/tmp/aitb-stall-test.bin HTTP/1.1\r\n` +
+        `Host: 127.0.0.1\r\nAuthorization: Bearer stall_token\r\n` +
+        `Content-Type: application/octet-stream\r\nContent-Length: 1000\r\n\r\n`
+      );
+      sock.write('12345');
+    });
+    assert.equal(result.includes('504'), true, `expected 504, got: ${result.slice(0, 80)}`);
+    assert.equal(result.includes('upload_stalled'), true);
+  } finally {
+    child2.kill('SIGKILL');
+  }
+});

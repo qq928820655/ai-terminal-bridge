@@ -284,21 +284,45 @@ async function readBody(req, limit = 1024 * 1024) {
   });
 }
 
-function readRaw(req, limit) {
+function readRaw(req, { limit, idleMs = 30000 }) {
   return new Promise((resolve, reject) => {
     let size = 0;
+    let done = false;
     const chunks = [];
+    let idleTimer = null;
+    const finish = (err, data) => {
+      if (done) return;
+      done = true;
+      if (idleTimer) clearTimeout(idleTimer);
+      if (err) reject(err);
+      else resolve(data);
+    };
+    const armIdle = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        // 只拒绝，不销毁 socket：让 504 响应能发出去，Node 会在响应后自行回收未读完的连接
+        finish(Object.assign(new Error(`upload stalled: no data for ${idleMs}ms`), { status: 504, code: 'upload_stalled', idleMs }));
+      }, idleMs);
+      idleTimer.unref();
+    };
+    armIdle();
     req.on('data', (chunk) => {
       size += chunk.length;
       if (size > limit) {
-        reject(Object.assign(new Error('payload too large'), { status: 413, code: 'payload_too_large' }));
-        req.destroy();
+        req.pause();
+        finish(Object.assign(new Error('payload too large'), { status: 413, code: 'payload_too_large' }));
         return;
       }
       chunks.push(chunk);
+      armIdle();
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
+    req.on('end', () => finish(null, Buffer.concat(chunks)));
+    req.on('error', (err) => finish(err));
+    req.on('close', () => {
+      if (!req.complete) {
+        finish(Object.assign(new Error('upload aborted before completion'), { status: 400, code: 'upload_aborted' }));
+      }
+    });
   });
 }
 
@@ -363,13 +387,12 @@ function escapeRx(text) {
 
 const CSI_RX = /\x1b\[[?0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07/g;
 
+// 归一化但不做边缘裁剪：/api/exec 的 output 保持字节精确（末尾换行保留）
 function cleanExecOutput(text) {
   return String(text || '')
     .replace(CSI_RX, '')
     .replace(/\r\n/g, '\n')
-    .replace(/\r/g, '')
-    .replace(/^\n+/, '')
-    .replace(/\n+$/, '');
+    .replace(/\r/g, '');
 }
 
 const EC_SENTINEL_RX = /\n__AITB_EC=(-?\d+)__\r?\n/;
@@ -446,7 +469,10 @@ function buildExecPayload(job, result) {
   const timedOut = Boolean(result.timedOut);
   const raw = String(result.data || '');
   const output = cleanExecOutput(raw);
-  const durationMs = Date.now() - job.startedAt;
+  const now = Date.now();
+  const durationMs = now - job.startedAt;
+  // 超时被杀时，deadline 之后花在收尾（SIGTERM→等待→强杀→清理）上的时间
+  const cleanupMs = timedOut && job.timeoutMs ? Math.max(0, now - (job.startedAt + job.timeoutMs)) : 0;
   return {
     execId: job.id,
     requestId: job.requestId || undefined,
@@ -461,6 +487,7 @@ function buildExecPayload(job, result) {
     bytesReturned: Buffer.byteLength(output),
     bytesTotal: Buffer.byteLength(raw),
     durationMs,
+    cleanupMs: cleanupMs || undefined,
   };
 }
 
@@ -887,7 +914,7 @@ async function handleApi(req, res, url) {
         err.code = 'spawn_failed';
         throw err;
       }
-      const payload = buildExecPayload({ id: session.id, requestId, session, label: cmdLabel, startedAt }, result);
+      const payload = buildExecPayload({ id: session.id, requestId, session, label: cmdLabel, startedAt, timeoutMs }, result);
       if (!body.keep) setTimeout(() => removeSession(session.id), 50).unref();
       return payload;
     };
@@ -994,20 +1021,51 @@ async function handleApi(req, res, url) {
     if (method === 'PUT' || method === 'POST') {
       let buf;
       try {
-        buf = await readRaw(req, settings.uploadMaxBytes);
+        buf = await readRaw(req, { limit: settings.uploadMaxBytes, idleMs: settings.uploadIdleMs });
       } catch (err) {
-        return sendError(res, req, err.status || 500, err.status === 413 ? 'payload_too_large' : 'upload_failed', err.message);
+        return sendError(res, req, err.status || 500, err.code || 'upload_failed', err.message);
+      }
+      const offsetParam = url.searchParams.get('offset');
+      let offset = 0;
+      if (offsetParam !== null) {
+        offset = Number(offsetParam);
+        if (!Number.isInteger(offset) || offset < 0) {
+          return sendError(res, req, 400, 'bad_request', 'offset must be a non-negative integer');
+        }
       }
       try {
         fs.mkdirSync(path.dirname(fp), { recursive: true });
-        const tmp = `${fp}.aitb-tmp-${crypto.randomBytes(4).toString('hex')}`;
-        fs.writeFileSync(tmp, buf, { mode: 0o644 });
-        fs.renameSync(tmp, fp);
+        if (offset > 0) {
+          // 断点续传：从 offset 处续写（先截断到 offset，容忍上次半截写入）
+          let st0;
+          try {
+            st0 = fs.statSync(fp);
+          } catch {
+            return sendError(res, req, 409, 'offset_without_file', `cannot resume: file does not exist: ${fp}`);
+          }
+          if (st0.size < offset) {
+            return sendError(res, req, 409, 'offset_beyond_eof', `cannot resume at ${offset}: file is ${st0.size} bytes`);
+          }
+          if (st0.size > offset) fs.truncateSync(fp, offset);
+          fs.appendFileSync(fp, buf);
+        } else {
+          const tmp = `${fp}.aitb-tmp-${crypto.randomBytes(4).toString('hex')}`;
+          fs.writeFileSync(tmp, buf, { mode: 0o644 });
+          fs.renameSync(tmp, fp);
+        }
       } catch (err) {
         return sendError(res, req, 500, 'write_failed', String(err.message || err));
       }
-      audit.add({ kind: 'file_upload', actor: actorOf(auth), ip: req.socket.remoteAddress || 'unknown', detail: `${fp} ${buf.length}B` });
-      return sendJson(res, 200, { ok: true, path: fp, bytes: buf.length, sha256: sha256(buf) }, corsHeaders(req));
+      const receivedBytes = offset + buf.length;
+      audit.add({ kind: 'file_upload', actor: actorOf(auth), ip: req.socket.remoteAddress || 'unknown', detail: `${fp} +${buf.length}B @${offset}` });
+      return sendJson(res, 200, {
+        ok: true,
+        path: fp,
+        bytes: buf.length,
+        offset: receivedBytes,
+        receivedBytes,
+        sha256: sha256(buf),
+      }, corsHeaders(req));
     }
     let st;
     try {
@@ -1017,6 +1075,9 @@ async function handleApi(req, res, url) {
     }
     if (st.isDirectory()) {
       return sendError(res, req, 400, 'is_directory', `path is a directory: ${fp}`);
+    }
+    if (url.searchParams.get('stat') === '1') {
+      return sendJson(res, 200, { ok: true, path: fp, size: st.size, mtimeMs: st.mtimeMs }, corsHeaders(req));
     }
     if (st.size > settings.uploadMaxBytes) {
       return sendError(res, req, 413, 'payload_too_large', `file exceeds ${settings.uploadMaxBytes} bytes`);

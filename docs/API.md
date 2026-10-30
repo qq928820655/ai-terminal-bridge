@@ -256,7 +256,8 @@ curl -s -X POST "$BASE/api/sessions/purge?ephemeral=1" -H "Authorization: Bearer
 
 - `exitCode`：真实退出码；**超时被杀时是 `124`**（不再返回 null），配合 `timedOut:true`
 - `truncatedReason`：截断原因，`timeout`（超时强杀）或 `killed`（手动 DELETE）
-- `output` 已清洗 ANSI/CR，无回显污染
+- `output` 已清洗 ANSI/CR，无回显污染；**字节精确，末尾换行保留**（`printf 'A\nB\nC\n'` 返回 `"A\nB\nC\n"`），可直接做逐字节比对
+- `cleanupMs`：超时被杀时，deadline 之后花在收尾上的毫秒数（端到端 ≈ timeoutMs + cleanupMs + 网络）
 - 客户端断连**不会**杀掉正在执行的命令（跑完为止）；`timeoutMs` 到点才杀
 - 超时先对命令发 SIGTERM（给脚本 trap 清理的机会），随后强杀
 
@@ -288,19 +289,33 @@ curl -s -X DELETE "$BASE/api/exec/$ID" -H "Authorization: Bearer $T"
 
 ### PUT /api/files?path=<绝对路径>
 
-上传文件（需要 `exec` scope）。body 为原始字节，上限 10MB（`AITB_UPLOAD_MAX_BYTES`）。父目录自动创建；写入为「临时文件 + rename」原子落盘。
+上传文件（需要 `exec` scope）。body 为原始字节，上限 10MB（`AITB_UPLOAD_MAX_BYTES`）。小文件（≤ 数百 KB）一次性写入为「临时文件 + rename」原子落盘，**上传中断不会留下半截文件**。
 
-```bash
-curl -s -X PUT "$BASE/api/files?path=/tmp/pkg.tar.gz" \
-  -H "Authorization: Bearer $T" \
-  -H "content-type: application/octet-stream" \
-  --data-binary @pkg.tar.gz
-# {"ok":true,"path":"/tmp/pkg.tar.gz","bytes":413696,"sha256":"090c..."}
+**响应：**
+
+```json
+{"ok":true,"path":"/tmp/pkg.tar.gz","bytes":4096,"offset":4096,"receivedBytes":4096,"sha256":"..."}
 ```
 
-### GET /api/files?path=<绝对路径>
+`receivedBytes` 为该路径当前累计字节数，作为下一次续传的 `offset`。
 
-下载文件。响应头带 `x-aitb-sha256`，可直接比对校验。404 返回 `{"error":"file not found","code":"file_not_found"}`。
+**断点续传（大文件推荐按 1MB 分块）：**
+
+```bash
+# 第一块
+curl -s -X PUT "$BASE/api/files?path=/tmp/big.bin" -H "Authorization: Bearer $T" \
+  -H "content-type: application/octet-stream" --data-binary @chunk_000
+# {"receivedBytes":1048576,...}
+# 后续块带 offset
+curl -s -X PUT "$BASE/api/files?path=/tmp/big.bin&offset=1048576" -H "Authorization: Bearer $T" \
+  -H "content-type: application/octet-stream" --data-binary @chunk_001
+```
+
+- `offset=N`：从位置 N 续写（先截断到 N，容忍上次半截写入）；文件不存在返回 `409 offset_without_file`，N 超过文件大小返回 `409 offset_beyond_eof`
+- 传输停滞（默认 30s 无数据，`AITB_UPLOAD_IDLE_MS`）服务端主动断开并返回 `504 {"code":"upload_stalled"}`——**不会无限挂死**
+- 客户端中断（未发完就断连）返回 `400 upload_aborted`
+
+**GET /api/files?path=<绝对路径>**：下载文件，`x-aitb-sha256` 头可校验。**`&stat=1`**：只查大小不传内容（续传前对齐用），返回 `{"size":n,"mtimeMs":...}`。404 返回 `{"code":"file_not_found"}`。
 
 ### GET /api/health
 
@@ -369,7 +384,27 @@ headers = {
 }
 ```
 
-### 8.2 curl 传 JSON body 的唯一正确姿势
+### 8.2 urllib 必须捕获 HTTPError，否则「令牌失效」看起来像「桥挂了」
+
+`urllib.request.urlopen` 对 4xx/5xx **抛 `HTTPError` 异常**（不是返回响应对象）。桥返回的 401 + JSON body 就挂在异常对象上。不捕获的话客户端只能看到「抛异常」，和连接层故障难以区分：
+
+```python
+import urllib.request, urllib.error
+
+def call(req, timeout=30):
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        # 401 = 令牌失效，桥是活的！body 在 e.read() 里
+        return e.code, json.loads(e.read() or b'{}')
+    except (urllib.error.URLError, TimeoutError) as e:
+        return 0, {"error": str(e)}   # 这才是「桥连不上」
+```
+
+判活顺序：`GET /api/health` 200 → 桥活着；再 401 → 令牌死了，**换令牌，别重启桥**。
+
+### 8.3 curl 传 body 的姿势 + 多行脚本规则
 
 ```bash
 # 正确：--data-binary @file 或 -d '<json>'
@@ -379,14 +414,46 @@ curl -X POST "$BASE/api/exec" -H "Authorization: Bearer $T" \
 # 错误：-F body.json（multipart 表单，本服务不解析）
 ```
 
-内联 JSON 含中文/引号时建议落成文件再 `--data-binary @file`。
+**多行脚本 / 带真实换行的内容，一律 `PUT /api/files` 落盘再 `exec` 执行，不要塞进 `command` 的内联 JSON**（JSON 字符串里真实换行必须转义成 `\n`，手拼必坏）：
 
-### 8.3 调用方建议
+```bash
+curl -X PUT "$BASE/api/files?path=/tmp/job.sh" -H "Authorization: Bearer $T" \
+  -H "content-type: application/octet-stream" --data-binary @script.sh
+curl -X POST "$BASE/api/exec" -H "Authorization: Bearer $T" \
+  -H "content-type: application/json" -d '{"command":"bash /tmp/job.sh","timeoutMs":60000}'
+```
+
+### 8.4 客户端超时取值硬规则
+
+**`curl -m` 必须 ≥ `timeoutMs/1000 + 30`。** 反例：`-m 15` 配 `timeoutMs:30000` → curl 15s 报 (28) 超时，而桥还在正常跑——现象和「桥挂了」一模一样。detach 模式没有这个问题（发起毫秒级返回），长任务优先 detach。
+
+### 8.5 空 200 响应的兜底
+
+代理层偶发返回「HTTP 200 但 body 为 0 字节」（桥侧从未发出过空体响应）。客户端 JSON 解析前先判空，空 body 按网络故障重试即可（带 `requestId` 时重试零副作用）：
+
+```python
+raw = resp.read()
+data = json.loads(raw) if raw else {"error": "empty_body", "retry": True}
+```
+
+### 8.6 调用方建议
 
 1. **所有 `/api/exec` 都带 `requestId`**（uuid 即可）：代理层重试不会产生重复副作用，回包可一一对应，响应里会回显 `requestId` + `cached` 标记。
 2. **超过 ~10s 的命令用 detach 模式**：发起请求毫秒级返回，不存在长连接被代理掐断的问题；轮询 status/output 都是幂等 GET。
-3. **超时判断看 `timedOut` + `exitCode=124`**，不要再拿 `exitCode:null` 猜。
-4. `output` 已清洗回显/ANSI/CR，但 detach 的 `output` 接口返回的是**清洗后增量**，翻页永远传服务端返回的 `offset`，不要自己用 bytesReturned 累加。
+3. **超时判断看 `timedOut` + `exitCode=124`**，不要再拿 `exitCode:null` 猜。超时的端到端耗时 ≈ `timeoutMs` + `cleanupMs`（SIGTERM 收尾）+ 网络延迟，轮询间隔要留余量。
+4. `output` 已清洗回显/ANSI/CR，**字节精确（末尾换行保留）**，可直接做 sha256sum / diff 比对。detach 的 `output` 接口翻页永远传服务端返回的 `offset`。
+5. **detach 翻页的推荐收敛循环**（任务结束后再查会返回空 data、offset 不变）：
+
+```python
+off = 0
+while True:
+    d = get(f"/api/exec/{eid}/output?offset={off}")
+    data = d.get("data") or ""
+    if not data or d.get("offset") == off:
+        break          # 空数据或 offset 没动 -> 到尾巴了
+    off = d["offset"]
+# 或者直接看 d["status"] != "running" 就不用翻页了
+```
 
 ## 9. 速率与限制
 
@@ -401,6 +468,6 @@ curl -X POST "$BASE/api/exec" -H "Authorization: Bearer $T" \
 | /api/exec 同步超时 | 默认 15s，最大 120s；超时 `exitCode=124` + `timedOut:true` |
 | /api/exec detach 超时 | 默认 15s，最大 10 分钟（`AITB_EXEC_MAX_MS`） |
 | detach 任务保留 | 10 分钟（`AITB_EXEC_TTL_MS`） |
-| 文件上传/下载 | 单文件 10MB（`AITB_UPLOAD_MAX_BYTES`） |
+| 文件上传/下载 | 单文件 10MB（`AITB_UPLOAD_MAX_BYTES`）；`?offset=N` 断点续传；停滞 30s 返回 504（`AITB_UPLOAD_IDLE_MS`） |
 | 会话 exec 超时 | 默认 30s，最大 120s，超时返回 `timedOut:true` + `truncatedReason:"timeout"` |
 | 审计日志保留 | 30 天（每小时自动清理） |
