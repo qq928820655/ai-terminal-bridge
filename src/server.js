@@ -496,6 +496,20 @@ function escalateKill(session) {
   session.kill('SIGTERM');
 }
 
+function auditExecCall(event) {
+  audit.add({
+    kind: 'exec',
+    actor: event.actor,
+    ip: event.ip,
+    sessionId: event.sessionId,
+    detail: String(event.command || '').slice(0, 2000),
+    output: String(event.output || '').slice(-20000),
+    exitCode: event.exitCode,
+    timedOut: Boolean(event.timedOut),
+    durationMs: event.durationMs,
+  });
+}
+
 async function runDetachedJob(job) {
   const { session } = job;
   let spawnError = '';
@@ -534,6 +548,16 @@ async function runDetachedJob(job) {
     job.finished = true;
   }
   job.finishedAt = Date.now();
+  auditExecCall({
+    actor: job.actor,
+    ip: job.ip,
+    sessionId: job.id,
+    command: job.command,
+    output: job.payload.output,
+    exitCode: job.payload.exitCode,
+    timedOut: job.payload.timedOut,
+    durationMs: job.payload.durationMs,
+  });
   // 从 manager 摘除（已退出，不影响 UI 会话列表与生命周期清扫），缓冲区仍留在 job 里供拉取
   manager.remove(job.id);
   if (job.requestId) execCachePut(`execid:${job.requestId}`, { execId: job.id });
@@ -868,6 +892,9 @@ async function handleApi(req, res, url) {
         timeoutMs: maxMs,
         finished: false,
         payload: null,
+        actor: actorOf(auth),
+        ip: req.socket.remoteAddress || 'unknown',
+        command: body.command,
       };
       execJobs.set(job.id, job);
       if (requestId) execJobByRequest.set(requestId, job.id);
@@ -915,6 +942,16 @@ async function handleApi(req, res, url) {
         throw err;
       }
       const payload = buildExecPayload({ id: session.id, requestId, session, label: cmdLabel, startedAt, timeoutMs }, result);
+      auditExecCall({
+        actor: actorOf(auth),
+        ip: req.socket.remoteAddress || 'unknown',
+        sessionId: session.id,
+        command: body.command,
+        output: payload.output,
+        exitCode: payload.exitCode,
+        timedOut: payload.timedOut,
+        durationMs: payload.durationMs,
+      });
       if (!body.keep) setTimeout(() => removeSession(session.id), 50).unref();
       return payload;
     };
@@ -1145,6 +1182,7 @@ async function handleApi(req, res, url) {
       }
       const requestId = body.requestId ? String(body.requestId).slice(0, 128) : '';
       const runSessionExec = async () => {
+        const startedAt = Date.now();
         const baseline = session.buffer.length;
         const sent = body.command.replace(/\r?\n$/, '') + '; printf \'\\n__AITB_EC=%s__\\n\' "$?"';
         session.write(sent + '\r');
@@ -1153,17 +1191,29 @@ async function handleApi(req, res, url) {
         const result = await waitForSentinel(session, baseline, waitMs);
         let output = stripEcho(result.before, sent);
         if (result.found) output = output.replace(/^\r?\n/, '').replace(/\r?\n$/, '');
-        return {
+        const cleaned = cleanExecOutput(output);
+        const payloadOut = {
           sessionId: session.id,
           requestId: requestId || undefined,
           offset: session.buffer.length,
-          output: cleanExecOutput(output),
+          output: cleaned,
           alive: session.alive,
           exitCode: result.found ? result.exitCode : null,
           truncated: !result.found,
           truncatedReason: result.found ? undefined : 'timeout',
           timedOut: !result.found,
         };
+        auditExecCall({
+          actor: actorOf(auth),
+          ip: req.socket.remoteAddress || 'unknown',
+          sessionId: session.id,
+          command: body.command,
+          output: cleaned,
+          exitCode: payloadOut.exitCode,
+          timedOut: payloadOut.timedOut,
+          durationMs: Date.now() - startedAt,
+        });
+        return payloadOut;
       };
       if (!requestId) {
         return sendJson(res, 200, await runSessionExec(), corsHeaders(req));

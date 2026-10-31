@@ -78,6 +78,21 @@ button.primary:hover { background: #2b7cf0; }
 .session-item .viewers { font-size: 10px; color: #6e7681; }
 .session-item .viewers.busy { color: #d29922; }
 .session-item .viewers.recent { color: #8b949e; }
+
+/* ---- API 调用列表 ---- */
+#execPanel { border-top: 1px solid #1f2430; padding-top: 8px; }
+#execList { list-style: none; margin: 4px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; max-height: 300px; overflow-y: auto; }
+.exec-row { display: grid; grid-template-columns: 58px 1fr; gap: 2px 8px; font-size: 11px; padding: 6px 8px; border: 1px solid #21262d; border-radius: 7px; background: #0b0e14; cursor: pointer; align-items: center; }
+.exec-row:hover { border-color: #1f6feb; background: #101828; }
+.exec-row .t { grid-row: span 2; color: #6e7681; align-self: start; }
+.exec-row .who { color: #c9d1d9; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.exec-row .cmd { grid-column: 1 / -1; font-family: ui-monospace, monospace; color: #8b949e; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.exec-row .st { color: #3fb950; font-size: 10px; text-align: right; }
+.exec-row.bad .st { color: #f85149; }
+.exec-head-row { grid-template-columns: 58px 130px 1fr 130px; }
+#auditExecList { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+#auditExecList .exec-row { grid-template-columns: 58px 130px 1fr 130px; }
+#auditExecList .exec-row .t { grid-row: auto; }
 .doc { margin-top: auto; border-top: 1px solid #1f2430; padding-top: 8px; }
 .doc-title { font-size: 11px; color: #7d8590; margin-bottom: 5px; }
 .doc-title-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px; }

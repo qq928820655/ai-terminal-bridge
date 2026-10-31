@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>AI Terminal Bridge</title>
 <link rel="stylesheet" href="/vendor/xterm.css" />
-<link rel="stylesheet" href="/style.css?v=12" />
+<link rel="stylesheet" href="/style.css?v=13" />
 </head>
 <body>
 <div id="app">
@@ -59,6 +59,15 @@
         <button id="refreshSessions">刷新</button>
       </div>
       <ul id="sessionList"></ul>
+    </section>
+
+    <section id="execPanel" class="hidden">
+      <div class="doc-title-row">
+        <div class="doc-title">API 调用</div>
+        <button id="btnExecRefresh" class="linkish">刷新</button>
+      </div>
+      <ul id="execList"></ul>
+      <div class="hint" id="execHint">最近 20 条 API 执行记录，5 秒自动刷新</div>
     </section>
 
     <section id="tokenPanel" class="hidden">
@@ -129,10 +138,27 @@ Authorization: Bearer &lt;token&gt;
         <span>创建时间</span><span>创建者 / 访问者</span><span>终端</span><span>状态</span>
       </div>
       <ul id="auditList"></ul>
+      <div class="doc-title" style="margin-top:14px">API 调用记录</div>
+      <div class="audit-head-row exec-head-row">
+        <span>时间</span><span>调用方</span><span>命令</span><span>结果</span>
+      </div>
+      <ul id="auditExecList"></ul>
       <div class="doc-title" style="margin-top:14px">事件流水</div>
       <ul id="auditEvents"></ul>
       <div class="hint" id="auditModalHint"></div>
     </div>
+  </div>
+</div>
+<div id="execModal" class="overlay hidden">
+  <div class="doc-window">
+    <div class="doc-window-head">
+      <span class="doc-window-title" id="execDetailTitle">API 调用详情</span>
+      <span class="doc-window-acts">
+        <button id="execDetailCopy">复制全文</button>
+        <button id="execDetailClose">关闭</button>
+      </span>
+    </div>
+    <div class="doc-window-body" id="execDetailBody"></div>
   </div>
 </div>
 <div id="termModal" class="overlay hidden">
@@ -149,6 +175,6 @@ Authorization: Bearer &lt;token&gt;
 </div>
 <script src="/vendor/xterm.js"></script>
 <script src="/vendor/addon-fit.js"></script>
-<script src="/app.js?v=12"></script>
+<script src="/app.js?v=13"></script>
 </body>
 </html>

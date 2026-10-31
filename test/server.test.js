@@ -925,3 +925,42 @@ test('stalled upload returns 504 error instead of hanging', async () => {
     child2.kill('SIGKILL');
   }
 });
+
+// ---- v15: API 调用审计可见 ----
+
+test('exec calls are audited with command, exit code and output', async () => {
+  const marker = `AUDIT_MARKER_${Math.random().toString(36).slice(2, 8)}`;
+  await api('POST', '/api/exec', { command: `echo ${marker}`, requestId: `audit-${marker}` });
+  await new Promise((r) => setTimeout(r, 150));
+
+  const list = await api('GET', '/api/audit?kind=exec&limit=10');
+  assert.equal(list.status, 200);
+  const hit = list.data.events.find((e) => (e.detail || '').includes(marker));
+  assert.equal(Boolean(hit), true, 'exec audit event missing');
+  assert.equal(hit.exitCode, 0);
+  assert.equal(hit.output.includes(marker), true);
+  assert.equal(typeof hit.durationMs, 'number');
+  assert.equal(Boolean(hit.actor), true);
+});
+
+test('timed-out exec is audited with timedOut flag', async () => {
+  await api('POST', '/api/exec', { command: 'sleep 4', timeoutMs: 800, requestId: 'audit-timeout-1' });
+  await new Promise((r) => setTimeout(r, 150));
+  const list = await api('GET', '/api/audit?kind=exec&limit=10');
+  const hit = list.data.events.find((e) => e.detail === 'sleep 4');
+  assert.equal(Boolean(hit), true);
+  assert.equal(hit.exitCode, 124);
+  assert.equal(hit.timedOut, true);
+});
+
+test('session exec calls are audited too', async () => {
+  const created = await api('POST', '/api/sessions', { name: 'audit-sess-exec' });
+  const sid = created.data.session.id;
+  const marker = `SESS_AUDIT_${Math.random().toString(36).slice(2, 8)}`;
+  await api('POST', `/api/sessions/${sid}/exec`, { command: `echo ${marker}` });
+  await api('DELETE', `/api/sessions/${sid}`);
+  const list = await api('GET', '/api/audit?kind=exec&limit=10');
+  const hit = list.data.events.find((e) => (e.detail || '').includes(marker));
+  assert.equal(Boolean(hit), true);
+  assert.equal(hit.exitCode, 0);
+});

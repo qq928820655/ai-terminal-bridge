@@ -88,7 +88,7 @@ function showLogin(message) {
 }
 
 function setSidebarLocked(locked) {
-  for (const id of ['sessionPanel', 'tokenPanel', 'docPanel', 'auditPanel']) {
+  for (const id of ['sessionPanel', 'tokenPanel', 'docPanel', 'auditPanel', 'execPanel']) {
     $(id).classList.toggle('hidden', locked);
   }
 }
@@ -137,8 +137,12 @@ function startApp() {
   loadSessions();
   loadTokens();
   loadAuditHint();
+  loadRecentExecs();
   setInterval(() => {
-    if (document.visibilityState === 'visible') loadSessions();
+    if (document.visibilityState === 'visible') {
+      loadSessions();
+      loadRecentExecs();
+    }
   }, 5000);
   $('empty').style.display = 'grid';
 }
@@ -525,6 +529,7 @@ async function loadAudit() {
       session_create: '创建终端', session_end: '终端结束',
       session_idle_kill: '空闲关闭', session_purge: '自动清除',
       session_reopen: '重新开启',
+      exec: 'API 执行', file_upload: '文件上传',
     };
     for (const ev of auditCache.slice(-80).reverse()) {
       const li = document.createElement('li');
@@ -534,6 +539,18 @@ async function loadAudit() {
       li.querySelector('.k').textContent = labels[ev.kind] || ev.kind;
       li.querySelector('.d').textContent = [ev.actor, ev.detail || (ev.sessionId || ''), ev.ip].filter(Boolean).join(' · ');
       evWrap.appendChild(li);
+    }
+
+    const execWrap = $('auditExecList');
+    execWrap.innerHTML = '';
+    const execEvents = auditCache.filter((e) => e.kind === 'exec').slice(-50).reverse();
+    for (const ev of execEvents) {
+      const li = document.createElement('li');
+      renderExecRow(li, ev);
+      execWrap.appendChild(li);
+    }
+    if (!execEvents.length) {
+      execWrap.innerHTML = '<li class="hint">还没有 API 调用记录</li>';
     }
 
     $('auditLive').classList.add('on');
@@ -596,6 +613,90 @@ async function loadAuditHint() {
   }
 }
 
+// ---- API 调用列表（侧栏 + 访问记录弹框共用行渲染）----
+
+let execEventsCache = [];
+
+function execBadges(ev) {
+  const bits = [];
+  if (ev.timedOut) bits.push('超时');
+  else if (ev.exitCode === 0) bits.push('exit 0');
+  else if (ev.exitCode === null || ev.exitCode === undefined) bits.push('exit ?');
+  else bits.push(`exit ${ev.exitCode}`);
+  if (typeof ev.durationMs === 'number') bits.push(`${(ev.durationMs / 1000).toFixed(1)}s`);
+  return bits.join(' · ');
+}
+
+function renderExecRow(li, ev) {
+  li.className = 'exec-row' + (ev.timedOut || (ev.exitCode !== 0 && ev.exitCode !== null && ev.exitCode !== undefined) ? ' bad' : '');
+  li.innerHTML = `
+    <span class="t"></span>
+    <span class="who"></span>
+    <span class="cmd"></span>
+    <span class="st"></span>`;
+  li.querySelector('.t').textContent = fmtTime(ev.ts);
+  li.querySelector('.who').textContent = ev.actor || '-';
+  li.querySelector('.cmd').textContent = (ev.detail || '').replace(/\s+/g, ' ').slice(0, 120);
+  const st = li.querySelector('.st');
+  st.textContent = execBadges(ev);
+  li.addEventListener('click', () => openExecDetail(ev));
+}
+
+async function loadRecentExecs() {
+  const list = $('execList');
+  if (!list) return;
+  try {
+    const data = await api('/api/audit?kind=exec&limit=20');
+    execEventsCache = data.events || [];
+    list.innerHTML = '';
+    for (const ev of execEventsCache.slice().reverse()) {
+      const li = document.createElement('li');
+      renderExecRow(li, ev);
+      list.appendChild(li);
+    }
+    if (!execEventsCache.length) {
+      list.innerHTML = '<li class="hint">还没有 API 调用记录</li>';
+    }
+    $('execHint').textContent = `最近 20 条 API 执行记录，5 秒自动刷新 · 查看全部请开「访问记录」`;
+  } catch (err) {
+    $('execHint').textContent = `API 调用记录需要 admin 权限：${err.message}`;
+  }
+}
+
+function openExecDetail(ev) {
+  $('execDetailTitle').textContent = `API 调用 · ${ev.actor || '-'} · ${fmtDateTime(ev.ts)}`;
+  const meta = [
+    `- 调用方：${ev.actor || '-'}`,
+    `- 来源 IP：${ev.ip || '-'}`,
+    `- 会话：${ev.sessionId || '-'}`,
+    `- 结果：${execBadges(ev)}`,
+    ev.sessionId && ev.sessionId.startsWith('s') ? `- 留存输出可查：GET /api/exec/${ev.sessionId}/output（10 分钟内）` : '',
+  ].filter(Boolean);
+  const md = [
+    `### API 调用详情`,
+    '',
+    meta.join('\n'),
+    '',
+    '**命令**',
+    '```bash',
+    ev.detail || '(未记录)',
+    '```',
+    '',
+    '**输出**',
+    '```',
+    ev.output || '(无输出)',
+    '```',
+  ].join('\n');
+  $('execDetailBody').innerHTML = renderMarkdown(md);
+  $('execDetailBody').dataset.raw = [
+    `# API 调用 ${fmtDateTime(ev.ts)} actor=${ev.actor || '-'} ip=${ev.ip || '-'}`,
+    `# exit=${ev.exitCode} timedOut=${Boolean(ev.timedOut)} durationMs=${ev.durationMs || 0} session=${ev.sessionId || '-'}`,
+    '$ ' + (ev.detail || ''),
+    ev.output || '(无输出)',
+  ].join('\n');
+  $('execModal').classList.remove('hidden');
+}
+
 $('btnAudit').addEventListener('click', openAuditModal);
 $('auditRefresh').addEventListener('click', loadAudit);
 $('auditClose').addEventListener('click', () => $('auditModal').classList.add('hidden'));
@@ -612,6 +713,20 @@ $('termIoCopy').addEventListener('click', async () => {
   $('termIoCopy').textContent = ok ? '已复制' : '复制失败';
   setTimeout(() => {
     $('termIoCopy').textContent = '复制全文';
+  }, 1500);
+});
+
+$('btnExecRefresh').addEventListener('click', loadRecentExecs);
+$('execDetailClose').addEventListener('click', () => $('execModal').classList.add('hidden'));
+$('execModal').addEventListener('click', (e) => {
+  if (e.target === $('execModal')) $('execModal').classList.add('hidden');
+});
+$('execDetailCopy').addEventListener('click', async () => {
+  const raw = $('execDetailBody').dataset.raw || '';
+  const ok = await copyText(raw);
+  $('execDetailCopy').textContent = ok ? '已复制' : '复制失败';
+  setTimeout(() => {
+    $('execDetailCopy').textContent = '复制全文';
   }, 1500);
 });
 
