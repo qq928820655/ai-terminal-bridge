@@ -50,13 +50,30 @@ function load(envFile = path.join(__dirname, '..', '.env')) {
   };
   const tokensFile = process.env.AITB_TOKENS_FILE || path.join(STATE_DIR, 'tokens.json');
   const accountsFile = process.env.AITB_ACCOUNTS_FILE || path.join(STATE_DIR, 'accounts.json');
-  const auditMaxAgeDays = int(process.env.AITB_AUDIT_MAX_AGE_DAYS, 30);
+  const auditMaxAgeDays = int(process.env.AITB_AUDIT_MAX_AGE_DAYS, 7);
   const num = (value, fallback) => {
     const n = Number(value);
     return Number.isFinite(n) && n > 0 ? n : fallback;
   };
-  const connIdleKillMs = num(process.env.AITB_CONN_IDLE_KILL_MS, 60 * 60 * 1000);
-  const connIdlePurgeMs = num(process.env.AITB_CONN_PURGE_MS, 3 * 24 * 60 * 60 * 1000);
+  const duration = (msValue, unitValue, unitMs, fallback) => {
+    const direct = num(msValue, 0);
+    if (direct) return direct;
+    const units = num(unitValue, 0);
+    if (units) return units * unitMs;
+    return fallback;
+  };
+  const connIdleKillMs = duration(
+    process.env.AITB_CONN_IDLE_KILL_MS,
+    process.env.AITB_CONN_IDLE_KILL_MINUTES,
+    60 * 1000,
+    60 * 60 * 1000,
+  );
+  const connIdlePurgeMs = duration(
+    process.env.AITB_CONN_PURGE_MS,
+    process.env.AITB_CONN_PURGE_DAYS,
+    24 * 60 * 60 * 1000,
+    3 * 24 * 60 * 60 * 1000,
+  );
   const connSweepMs = num(process.env.AITB_CONN_SWEEP_MS, 60 * 1000);
   const uploadMaxBytes = int(process.env.AITB_UPLOAD_MAX_BYTES, 10 * 1024 * 1024);
   const uploadIdleMs = int(process.env.AITB_UPLOAD_IDLE_MS, 30 * 1000);

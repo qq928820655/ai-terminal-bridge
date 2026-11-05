@@ -680,7 +680,7 @@ async function handleApi(req, res, url) {
 
   if (pathname === '/api/audit' && method === 'GET') {
     if (!need('admin')) return;
-    const limit = Math.min(Number(url.searchParams.get('limit')) || 200, 1000);
+    const limit = Math.min(Number(url.searchParams.get('limit')) || 200, 5000);
     const kind = url.searchParams.get('kind') || undefined;
     const actor = url.searchParams.get('actor') || undefined;
     return sendJson(res, 200, { events: audit.list({ limit, kind, actor }), info: audit.info() }, corsHeaders(req));
@@ -1260,7 +1260,11 @@ function serveStatic(req, res, pathname) {
     }
     res.writeHead(200, {
       'content-type': MIME[path.extname(filePath)] || 'application/octet-stream',
-      'cache-control': filePath.startsWith(PUBLIC_DIR) ? 'no-cache' : 'public, max-age=86400',
+      'cache-control': filePath.endsWith('index.html')
+        ? 'no-store'
+        : filePath.startsWith(PUBLIC_DIR)
+          ? 'no-cache'
+          : 'public, max-age=86400',
     });
     res.end(data);
   });

@@ -58,7 +58,10 @@ web ui: http://127.0.0.1:8787/?token=<token>
 | `AITB_SHELL` | `/bin/bash` | 默认 shell |
 | `AITB_CWD` | 启动目录 | 默认工作目录 |
 | `AITB_MAX_SESSIONS` | `8` | 并发会话上限 |
-| `AITB_SESSION_IDLE_MS` | `1800000` | 空闲回收时间 |
+| `AITB_SESSION_IDLE_MS` | `1800000` | 会话空闲回收时间 |
+| `AITB_CONN_IDLE_KILL_MINUTES` | `60` | 无连接多少分钟后自动关闭会话（`AITB_CONN_IDLE_KILL_MS` 可直传毫秒） |
+| `AITB_CONN_PURGE_DAYS` | `3` | 关闭后多少天无人使用则清除（`AITB_CONN_PURGE_MS` 可直传毫秒） |
+| `AITB_CONN_SWEEP_MS` | `60000` | 生命周期巡检间隔 |
 | `AITB_MAX_TTL_MS` | `2592000000`（30d） | 临时令牌最长有效期 |
 | `AITB_CORS` | `*` | 允许跨域的 Origin，设为空关闭 CORS 头 |
 
@@ -319,4 +322,4 @@ sudo ./deploy/uninstall.sh   # 卸载
 npm test
 ```
 
-覆盖鉴权、令牌增删改查与过期、权限范围、轮换停用、一次性执行、会话生命周期、WebSocket 流、静态资源等 20 个用例。
+覆盖鉴权、令牌增删改查与过期、权限范围、轮换停用、一次性执行、会话生命周期、WebSocket 流、静态资源、detach、断点续传、超时语义、审计、配置解析等 55 个用例。

@@ -9,6 +9,9 @@ let username = localStorage.getItem(USER_KEY) || 'admin';
 const urlToken = new URLSearchParams(location.search).get('token');
 if (urlToken) history.replaceState(null, '', location.pathname);
 
+const appVerMatch = (document.querySelector('script[src*="app.js"]') || { src: '' }).src.match(/v=(\d+)/);
+if (appVerMatch && $('uiVer')) $('uiVer').textContent = ' · v' + appVerMatch[1];
+
 let term = null;
 let fit = null;
 let socket = null;
@@ -21,7 +24,115 @@ function setConn(text, ok) {
   const el = $('connState');
   el.textContent = text;
   el.style.color = ok ? '#3fb950' : '#7d8590';
+  const m = $('mConn');
+  if (m) {
+    m.textContent = text;
+    m.style.color = ok ? '#3fb950' : '#7d8590';
+  }
 }
+
+const mobileQuery = window.matchMedia('(max-width: 760px)');
+function isMobile() {
+  return mobileQuery.matches;
+}
+
+function setMobileView(view) {
+  const next = view === 'term' ? 'term' : 'menu';
+  document.body.classList.toggle('view-term', next === 'term');
+  document.body.classList.toggle('view-menu', next === 'menu');
+  $('mViewMenu').classList.toggle('active', next === 'menu');
+  $('mViewTerm').classList.toggle('active', next === 'term');
+  if (next === 'term') {
+    const reveal = () => {
+      safeFit();
+      if (term) {
+        try {
+          term.refresh(0, Math.max(0, term.rows - 1));
+        } catch {
+          /* no rows yet */
+        }
+      }
+    };
+    requestAnimationFrame(reveal);
+    setTimeout(reveal, 120);
+  }
+}
+
+function setMobileTermAvailable(available) {
+  $('mViewTerm').classList.toggle('hidden', !available);
+  if (!available) setMobileView('menu');
+}
+setMobileView('menu');
+setMobileTermAvailable(false);
+$('mViewMenu').addEventListener('click', () => setMobileView('menu'));
+$('mViewTerm').addEventListener('click', () => setMobileView('term'));
+
+const MOBILE_KEY_SEQ = {
+  esc: '\x1b',
+  tab: '\t',
+  'ctrl-c': '\x03',
+  'ctrl-d': '\x04',
+  'ctrl-z': '\x1a',
+  left: '\x1b[D',
+  up: '\x1b[A',
+  down: '\x1b[B',
+  right: '\x1b[C',
+  pipe: '|',
+  dash: '-',
+  slash: '/',
+};
+
+function sendInput(data) {
+  if (socket && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type: 'input', data }));
+    return true;
+  }
+  return false;
+}
+
+$('mobileKeys').addEventListener('click', async (e) => {
+  const btn = e.target.closest('button[data-seq]');
+  if (!btn) return;
+  const key = btn.dataset.seq;
+  if (key === 'paste') {
+    const text = await readClipboard();
+    if (text) sendInput(text);
+    return;
+  }
+  const seq = MOBILE_KEY_SEQ[key];
+  if (seq !== undefined) sendInput(seq);
+});
+
+async function readClipboard() {
+  try {
+    if (navigator.clipboard && navigator.clipboard.readText) {
+      const text = await navigator.clipboard.readText();
+      if (text) return text;
+    }
+  } catch {
+    /* permission denied */
+  }
+  const text = window.prompt('粘贴要发送到终端的内容：');
+  return text || '';
+}
+
+$('terminal').addEventListener('click', () => {
+  if (term) term.focus();
+});
+
+mobileQuery.addEventListener('change', () => {
+  if (!isMobile()) {
+    document.body.classList.remove('view-menu', 'view-term');
+    $('mViewMenu').classList.remove('active');
+    $('mViewTerm').classList.remove('active');
+  } else if (currentId) {
+    setMobileView('term');
+  } else {
+    setMobileView('menu');
+  }
+  setTimeout(safeFit, 60);
+});
+
 
 function onUnauthorized() {
   sessionToken = '';
@@ -83,12 +194,13 @@ function showLogin(message) {
   $('loginErr').textContent = message || '';
   $('loginPass').value = '';
   setSidebarLocked(true);
+  setMobileTermAvailable(false);
   $('empty').textContent = '登录后可使用终端';
   setTimeout(() => $('loginPass').focus(), 50);
 }
 
 function setSidebarLocked(locked) {
-  for (const id of ['sessionPanel', 'tokenPanel', 'docPanel', 'auditPanel', 'execPanel']) {
+  for (const id of ['sessionPanel', 'tokenPanel', 'docPanel', 'auditPanel']) {
     $(id).classList.toggle('hidden', locked);
   }
 }
@@ -134,14 +246,13 @@ function startApp() {
   appStarted = true;
   setUser(username, authKind);
   ensureTerminal();
+  setMobileTermAvailable(true);
   loadSessions();
   loadTokens();
   loadAuditHint();
-  loadRecentExecs();
   setInterval(() => {
     if (document.visibilityState === 'visible') {
       loadSessions();
-      loadRecentExecs();
     }
   }, 5000);
   $('empty').style.display = 'grid';
@@ -252,8 +363,9 @@ function ensureTerminal() {
   if (term) return;
   term = new Terminal({
     fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
-    fontSize: 13,
+    fontSize: isMobile() ? 12 : 13,
     cursorBlink: true,
+    scrollback: 2000,
     theme: {
       background: '#0b0e14',
       foreground: '#c9d1d9',
@@ -264,7 +376,7 @@ function ensureTerminal() {
   fit = new FitAddon.FitAddon();
   term.loadAddon(fit);
   term.open($('terminal'));
-  fit.fit();
+  safeFit();
   term.onData((data) => {
     if (socket && socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify({ type: 'input', data }));
@@ -275,13 +387,32 @@ function ensureTerminal() {
       socket.send(JSON.stringify({ type: 'resize', cols, rows }));
     }
   });
-  window.addEventListener('resize', () => {
-    try {
-      fit.fit();
-    } catch {
-      /* hidden */
+  window.addEventListener('resize', safeFit);
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', safeFit);
+  term.attachCustomKeyEventHandler((e) => {
+    if (isMobile()) return true;
+    if ((e.ctrlKey || e.metaKey) && e.key === 'c' && term.hasSelection()) {
+      const sel = term.getSelection();
+      if (sel) {
+        copyText(sel);
+        term.clearSelection();
+        return false;
+      }
     }
+    if ((e.ctrlKey || e.metaKey) && e.key === 'v') return true;
+    return true;
   });
+}
+
+function safeFit() {
+  if (!fit || !term) return;
+  const host = $('terminal');
+  if (!host || host.offsetParent === null) return;
+  try {
+    fit.fit();
+  } catch {
+    /* hidden or zero-size */
+  }
 }
 
 let reconnectTimer = null;
@@ -309,7 +440,7 @@ function connect(sessionId) {
   sock.onopen = () => {
     if (sock !== socket) return;
     setConn('已连接', true);
-    fit.fit();
+    safeFit();
     socket._ping = setInterval(() => {
       if (socket.readyState === WebSocket.OPEN) {
         socket.send(JSON.stringify({ type: 'ping' }));
@@ -417,10 +548,14 @@ function renderSessions(sessions) {
         currentId = null;
         term && term.reset();
         $('empty').style.display = 'grid';
+        if (isMobile()) setMobileView('menu');
       }
       loadSessions();
     });
-    li.addEventListener('click', () => connect(s.id));
+    li.addEventListener('click', () => {
+      connect(s.id);
+      if (isMobile()) setMobileView('term');
+    });
     list.appendChild(li);
   }
 }
@@ -439,6 +574,13 @@ function fmtDateTime(ts) {
 
 let auditTimer = null;
 let auditCache = [];
+let auditEventsSig = '';
+let auditExecSig = '';
+
+function eventsSig(events) {
+  const n = events.length;
+  return `${n}:${n ? events[0].ts : 0}:${n ? events[n - 1].ts : 0}`;
+}
 
 function buildTerminals(events) {
   const map = new Map();
@@ -479,7 +621,7 @@ function findSessionEnd(sessionId) {
 
 async function loadAudit() {
   try {
-    const data = await api('/api/audit?limit=1000');
+    const data = await api('/api/audit?limit=5000');
     auditCache = data.events;
     const list = $('auditList');
     list.innerHTML = '';
@@ -521,40 +663,52 @@ async function loadAudit() {
     }
 
     const evWrap = $('auditEvents');
-    evWrap.innerHTML = '';
-    const labels = {
-      login: '登录', login_fail: '登录失败', logout: '退出',
-      ws_connect: '终端接入', ws_disconnect: '终端断开', ws_kill: '终止终端',
-      api: '接口调用', forbidden: '权限拒绝',
-      session_create: '创建终端', session_end: '终端结束',
-      session_idle_kill: '空闲关闭', session_purge: '自动清除',
-      session_reopen: '重新开启',
-      exec: 'API 执行', file_upload: '文件上传',
-    };
-    for (const ev of auditCache.slice(-80).reverse()) {
-      const li = document.createElement('li');
-      li.className = 'audit-ev' + (ev.kind === 'login_fail' || ev.kind === 'forbidden' ? ' bad' : '');
-      li.innerHTML = `<span class="t"></span><span class="k"></span><span class="d"></span>`;
-      li.querySelector('.t').textContent = fmtDateTime(ev.ts);
-      li.querySelector('.k').textContent = labels[ev.kind] || ev.kind;
-      li.querySelector('.d').textContent = [ev.actor, ev.detail || (ev.sessionId || ''), ev.ip].filter(Boolean).join(' · ');
-      evWrap.appendChild(li);
+    const evSig = eventsSig(auditCache);
+    if (evSig !== auditEventsSig) {
+      auditEventsSig = evSig;
+      evWrap.innerHTML = '';
+      const labels = {
+        login: '登录', login_fail: '登录失败', logout: '退出',
+        ws_connect: '终端接入', ws_disconnect: '终端断开', ws_kill: '终止终端',
+        api: '接口调用', forbidden: '权限拒绝',
+        session_create: '创建终端', session_end: '终端结束',
+        session_idle_kill: '空闲关闭', session_purge: '自动清除',
+        session_reopen: '重新开启',
+        exec: 'API 执行', file_upload: '文件上传',
+      };
+      for (const ev of auditCache.slice().reverse()) {
+        const li = document.createElement('li');
+        li.className = 'audit-ev' + (ev.kind === 'login_fail' || ev.kind === 'forbidden' ? ' bad' : '');
+        li.innerHTML = `<span class="t"></span><span class="k"></span><span class="d"></span>`;
+        li.querySelector('.t').textContent = fmtDateTime(ev.ts);
+        li.querySelector('.k').textContent = labels[ev.kind] || ev.kind;
+        li.querySelector('.d').textContent = [ev.actor, ev.detail || (ev.sessionId || ''), ev.ip].filter(Boolean).join(' · ');
+        evWrap.appendChild(li);
+      }
     }
 
     const execWrap = $('auditExecList');
-    execWrap.innerHTML = '';
-    const execEvents = auditCache.filter((e) => e.kind === 'exec').slice(-50).reverse();
-    for (const ev of execEvents) {
-      const li = document.createElement('li');
-      renderExecRow(li, ev);
-      execWrap.appendChild(li);
+    const scroller = execWrap.closest('.doc-window-body');
+    const keepScroll = scroller ? scroller.scrollTop : 0;
+    const execEvents = auditCache.filter((e) => e.kind === 'exec');
+    const xSig = eventsSig(execEvents);
+    if (xSig !== auditExecSig) {
+      auditExecSig = xSig;
+      execWrap.innerHTML = '';
+      for (const ev of execEvents.slice().reverse()) {
+        const li = document.createElement('li');
+        renderExecRow(li, ev);
+        execWrap.appendChild(li);
+        execWrap.appendChild(buildExecExpand(ev));
+      }
+      if (!execEvents.length) {
+        execWrap.innerHTML = '<li class="hint">还没有 API 调用记录</li>';
+      }
     }
-    if (!execEvents.length) {
-      execWrap.innerHTML = '<li class="hint">还没有 API 调用记录</li>';
-    }
+    if (scroller) scroller.scrollTop = keepScroll;
 
     $('auditLive').classList.add('on');
-    $('auditModalHint').textContent = `共 ${data.info.count} 条事件 / ${terminals.length} 个终端 · 保留 ${Math.round(data.info.maxAgeMs / 86400000)} 天 · 点击终端行查看输入输出`;
+    $('auditModalHint').textContent = `共 ${data.info.count} 条事件 / ${terminals.length} 个终端 · 保留 ${Math.round(data.info.maxAgeMs / 86400000)} 天 · 点终端行看输入输出与 API 交互`;
     $('auditHint').textContent = `共 ${terminals.length} 个终端 / ${data.info.count} 条事件`;
   } catch (err) {
     $('auditLive').classList.remove('on');
@@ -587,6 +741,16 @@ async function openTermIo(acc, endEv) {
     live = false;
   }
   if (!endEv) endEv = findSessionEnd(acc.sessionId);
+  let execs = auditCache.filter((e) => e.kind === 'exec' && e.sessionId === acc.sessionId);
+  if (!auditCache.length) {
+    try {
+      const d = await api('/api/audit?kind=exec&limit=5000');
+      execs = (d.events || []).filter((e) => e.sessionId === acc.sessionId);
+    } catch {
+      execs = [];
+    }
+  }
+  execs = execs.slice().reverse();
   const md = [
     `### 终端 ${acc.sessionId}`,
     '',
@@ -599,9 +763,16 @@ async function openTermIo(acc, endEv) {
     '```',
     output || '(无输出记录)',
     '```',
-  ].join('\n');
-  $('termIoBody').innerHTML = renderMarkdown(md);
-  $('termIoBody').dataset.raw = md;
+  ];
+  if (execs.length) {
+    md.push('', `### API 交互记录（${execs.length} 条）`, '');
+    for (const e of execs) {
+      md.push(`**${fmtDateTime(e.ts)} · ${e.actor || '-'} · ${execBadges(e)}**`, '', '```bash', '$ ' + (e.detail || ''), e.output || '(无输出)', '```', '');
+    }
+  }
+  const full = md.join('\n');
+  $('termIoBody').innerHTML = renderMarkdown(full);
+  $('termIoBody').dataset.raw = full;
 }
 
 async function loadAuditHint() {
@@ -615,8 +786,6 @@ async function loadAuditHint() {
 
 // ---- API 调用列表（侧栏 + 访问记录弹框共用行渲染）----
 
-let execEventsCache = [];
-
 function execBadges(ev) {
   const bits = [];
   if (ev.timedOut) bits.push('超时');
@@ -625,6 +794,58 @@ function execBadges(ev) {
   else bits.push(`exit ${ev.exitCode}`);
   if (typeof ev.durationMs === 'number') bits.push(`${(ev.durationMs / 1000).toFixed(1)}s`);
   return bits.join(' · ');
+}
+
+function execRawText(ev) {
+  return [
+    `# API 调用 ${fmtDateTime(ev.ts)} actor=${ev.actor || '-'} ip=${ev.ip || '-'}`,
+    `# exit=${ev.exitCode} timedOut=${Boolean(ev.timedOut)} durationMs=${ev.durationMs || 0} session=${ev.sessionId || '-'}`,
+    '$ ' + (ev.detail || ''),
+    ev.output || '(无输出)',
+  ].join('\n');
+}
+
+function buildExecExpand(ev) {
+  const li = document.createElement('li');
+  li.className = 'exec-expand';
+  const meta = document.createElement('div');
+  meta.className = 'xmeta';
+  meta.textContent = [
+    `调用方 ${ev.actor || '-'}`,
+    `IP ${ev.ip || '-'}`,
+    `会话 ${ev.sessionId || '-'}`,
+    execBadges(ev),
+    fmtDateTime(ev.ts),
+  ].filter(Boolean).join(' · ');
+  li.appendChild(meta);
+  const mkBlock = (label, text) => {
+    const lbl = document.createElement('div');
+    lbl.className = 'lbl';
+    lbl.textContent = label;
+    const pre = document.createElement('pre');
+    pre.textContent = text;
+    li.appendChild(lbl);
+    li.appendChild(pre);
+  };
+  mkBlock('命令', ev.detail || '(未记录)');
+  mkBlock('输出', ev.output || '(无输出)');
+  const acts = document.createElement('div');
+  acts.className = 'xacts';
+  const copyBtn = document.createElement('button');
+  copyBtn.className = 'linkish';
+  copyBtn.type = 'button';
+  copyBtn.textContent = '复制全文';
+  copyBtn.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    const ok = await copyText(execRawText(ev));
+    copyBtn.textContent = ok ? '已复制' : '复制失败';
+    setTimeout(() => {
+      copyBtn.textContent = '复制全文';
+    }, 1500);
+  });
+  acts.appendChild(copyBtn);
+  li.appendChild(acts);
+  return li;
 }
 
 function renderExecRow(li, ev) {
@@ -639,64 +860,16 @@ function renderExecRow(li, ev) {
   li.querySelector('.cmd').textContent = (ev.detail || '').replace(/\s+/g, ' ').slice(0, 120);
   const st = li.querySelector('.st');
   st.textContent = execBadges(ev);
-  li.addEventListener('click', () => openExecDetail(ev));
 }
 
-async function loadRecentExecs() {
-  const list = $('execList');
-  if (!list) return;
-  try {
-    const data = await api('/api/audit?kind=exec&limit=20');
-    execEventsCache = data.events || [];
-    list.innerHTML = '';
-    for (const ev of execEventsCache.slice().reverse()) {
-      const li = document.createElement('li');
-      renderExecRow(li, ev);
-      list.appendChild(li);
-    }
-    if (!execEventsCache.length) {
-      list.innerHTML = '<li class="hint">还没有 API 调用记录</li>';
-    }
-    $('execHint').textContent = `最近 20 条 API 执行记录，5 秒自动刷新 · 查看全部请开「访问记录」`;
-  } catch (err) {
-    $('execHint').textContent = `API 调用记录需要 admin 权限：${err.message}`;
-  }
+function setAuditTab(tab) {
+  $('auditTabTerm').classList.toggle('on', tab === 'term');
+  $('auditTabApi').classList.toggle('on', tab === 'api');
+  $('auditPaneTerm').classList.toggle('hidden', tab !== 'term');
+  $('auditPaneApi').classList.toggle('hidden', tab !== 'api');
 }
-
-function openExecDetail(ev) {
-  $('execDetailTitle').textContent = `API 调用 · ${ev.actor || '-'} · ${fmtDateTime(ev.ts)}`;
-  const meta = [
-    `- 调用方：${ev.actor || '-'}`,
-    `- 来源 IP：${ev.ip || '-'}`,
-    `- 会话：${ev.sessionId || '-'}`,
-    `- 结果：${execBadges(ev)}`,
-    ev.sessionId && ev.sessionId.startsWith('s') ? `- 留存输出可查：GET /api/exec/${ev.sessionId}/output（10 分钟内）` : '',
-  ].filter(Boolean);
-  const md = [
-    `### API 调用详情`,
-    '',
-    meta.join('\n'),
-    '',
-    '**命令**',
-    '```bash',
-    ev.detail || '(未记录)',
-    '```',
-    '',
-    '**输出**',
-    '```',
-    ev.output || '(无输出)',
-    '```',
-  ].join('\n');
-  $('execDetailBody').innerHTML = renderMarkdown(md);
-  $('execDetailBody').dataset.raw = [
-    `# API 调用 ${fmtDateTime(ev.ts)} actor=${ev.actor || '-'} ip=${ev.ip || '-'}`,
-    `# exit=${ev.exitCode} timedOut=${Boolean(ev.timedOut)} durationMs=${ev.durationMs || 0} session=${ev.sessionId || '-'}`,
-    '$ ' + (ev.detail || ''),
-    ev.output || '(无输出)',
-  ].join('\n');
-  $('execModal').classList.remove('hidden');
-}
-
+$('auditTabTerm').addEventListener('click', () => setAuditTab('term'));
+$('auditTabApi').addEventListener('click', () => setAuditTab('api'));
 $('btnAudit').addEventListener('click', openAuditModal);
 $('auditRefresh').addEventListener('click', loadAudit);
 $('auditClose').addEventListener('click', () => $('auditModal').classList.add('hidden'));
@@ -713,20 +886,6 @@ $('termIoCopy').addEventListener('click', async () => {
   $('termIoCopy').textContent = ok ? '已复制' : '复制失败';
   setTimeout(() => {
     $('termIoCopy').textContent = '复制全文';
-  }, 1500);
-});
-
-$('btnExecRefresh').addEventListener('click', loadRecentExecs);
-$('execDetailClose').addEventListener('click', () => $('execModal').classList.add('hidden'));
-$('execModal').addEventListener('click', (e) => {
-  if (e.target === $('execModal')) $('execModal').classList.add('hidden');
-});
-$('execDetailCopy').addEventListener('click', async () => {
-  const raw = $('execDetailBody').dataset.raw || '';
-  const ok = await copyText(raw);
-  $('execDetailCopy').textContent = ok ? '已复制' : '复制失败';
-  setTimeout(() => {
-    $('execDetailCopy').textContent = '复制全文';
   }, 1500);
 });
 
@@ -1016,6 +1175,7 @@ $('newSession').addEventListener('click', async () => {
     const data = await api('/api/sessions', { method: 'POST', body: '{}' });
     await loadSessions();
     connect(data.session.id);
+    if (isMobile()) setMobileView('term');
   } catch (err) {
     setConn(err.message, false);
   }
